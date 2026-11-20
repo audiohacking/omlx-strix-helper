@@ -14,4 +14,11 @@ From the oMLX checkout, so this package is imported instead of `apps/omlx-cuda-h
   -o 'pythonpath=apps/omlx-strixworker apps/omlx-cuda-helper/tests' -q
 ```
 
-`test_protocol.py` pairs with a real oMLX `PairingManager` and drives the control channel. `test_chain.py` runs two stage processes with the fake family. Both passed against this package.
+`test_qwen3_5.py` replays the oMLX contract fixture through this package's stage. On a Mac that is the Metal path, the same one the CUDA helper uses when CUDA is absent. The CUDA-only oQh checks stay skipped until that kernel is ported.
+
+```bash
+.venv/bin/pytest apps/omlx-cuda-helper/tests/test_qwen3_5.py \
+  apps/omlx-cuda-helper/tests/test_protocol.py \
+  apps/omlx-cuda-helper/tests/test_chain.py \
+  -o 'pythonpath=apps/omlx-strixworker apps/omlx-cuda-helper/tests' -q
+```
