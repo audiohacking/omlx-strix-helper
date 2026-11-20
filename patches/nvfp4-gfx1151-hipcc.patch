@@ -1,0 +1,59 @@
+--- a/mlx/backend/rocm/quantized/qmm.hip
++++ b/mlx/backend/rocm/quantized/qmm.hip
+@@ -6747,54 +6747,8 @@
+       return;
+     }
+     if (nvfp4_expert_batched) {
+-      // Eight rows a chunk and four columns per 16-lane group, measured on
+-      // gfx1151 with Nemotron-Cascade-2-30B-A3B-nvfp4 against (rows,
+-      // columns) of (4, 1), (8, 1), (16, 1), (8, 2) and (4, 4)
+-      // (LOCAL_FIXES.md item 69).
+-      constexpr int kTokens = 8;
+-      constexpr int kCols = 4;
+-      constexpr int kColsPerBlock = rocm::kNvfp4ColsPerBlock * kCols;
+-      dim3 grid((N + kColsPerBlock - 1) / kColsPerBlock, 1, E + 1);
+-      dim3 block(rocm::kNvfp4LanesPerCol, rocm::kNvfp4ColsPerBlock);
+-      const float* gs =
+-          global_scale ? gpu_ptr<const float>(*global_scale) : nullptr;
+-      auto launch = [&](auto type_tag) {
+-        using T = typename decltype(type_tag)::type;
+-        enc.add_kernel_node(
+-            &rocm::nvfp4_gather_expert_batched_kernel<T, kTokens, kCols>,
+-            grid,
+-            block,
+-            0u,
+-            gpu_ptr<const T>(x),
+-            gpu_ptr<const uint32_t>(w),
+-            gpu_ptr<const uint8_t>(scales),
+-            gs,
+-            a.lhs_indices,
+-            a.rhs_indices,
+-            a.batch_shape,
+-            a.lhs_idx_strides,
+-            a.rhs_idx_strides,
+-            a.batch_ndim,
+-            gpu_ptr<T>(out),
+-            B,
+-            N,
+-            K,
+-            E);
+-      };
+-      switch (x.dtype()) {
+-        case float32:
+-          launch(nvfp4_type_tag<float>{});
+-          break;
+-        case float16:
+-          launch(nvfp4_type_tag<__half>{});
+-          break;
+-        case bfloat16:
+-          launch(nvfp4_type_tag<hip_bfloat16>{});
+-          break;
+-        default:
+-          throw std::runtime_error("[nvfp4] unsupported activation dtype");
+-      }
+-      return;
++      // hipcc 7.18 aborts in instruction selection for
++      // nvfp4_gather_expert_batched_kernel on gfx1151. Use nvfp4_qmv.
+     }
+     nvfp4_qmv(
+         enc,
