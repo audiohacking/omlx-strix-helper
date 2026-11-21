@@ -146,7 +146,8 @@ __launch_bounds__(256, (__clang_major__ >= 24 && kHeadMajor) ? 6 : 2) __global__
                              std::uint32_t start_pos, std::size_t batch_size,
                              float* __restrict__ lse_out,
                              std::uint32_t key_begin,
-                             std::uint32_t first_query) {
+                             std::uint32_t first_query,
+                             std::uint32_t capacity) {
   constexpr std::uint32_t kRowBlocks = (kQueryRows / 16) * kWmmaHeads;
   constexpr std::uint32_t kKeyBlocks = kKeys / 16;
   constexpr std::uint32_t kSTiles = kRowBlocks * kKeyBlocks;
@@ -248,8 +249,10 @@ __launch_bounds__(256, (__clang_major__ >= 24 && kHeadMajor) ? 6 : 2) __global__
   const std::uint32_t v_key = lane % kKeys;
   const std::uint32_t v_slice = (tid / kKeys) * (kVRegs * 8);
   constexpr std::size_t kv_stride = kHeadMajor ? kHeadDim : kKvWidth;
+  // Packed heads sit `capacity` positions apart, so a row keeps its place
+  // as the prompt grows.
   const std::size_t head_offset = static_cast<std::size_t>(kv_head) * kHeadDim *
-                                  (kHeadMajor ? context_end : 1);
+                                  (kHeadMajor ? capacity : 1);
   const auto* v_base = v_cache_f16 + head_offset + v_slice;
   const auto* k_base = k_cache_f16 + head_offset;
 
@@ -260,13 +263,11 @@ __launch_bounds__(256, (__clang_major__ >= 24 && kHeadMajor) ? 6 : 2) __global__
       // Each wave consumes two dimension tiles. The temporary value layout
       // supplies their WMMA fragments directly, avoiding a repeated LDS
       // transpose and barrier for every 16-key tile.
-      const std::size_t padded = (context_end + 15u) & ~std::size_t{15};
 #pragma unroll
       for (std::uint32_t t = 0; t < 2; ++t) {
         const std::uint32_t dim = (wave + t * 8u) * 16u + sub;
         dst[t] = LoadFrag(
-            v_cache_f16 +
-            static_cast<std::size_t>(kv_head) * padded * kHeadDim +
+            v_cache_f16 + head_offset +
             static_cast<std::size_t>(key_start / 16u) * kHeadDim * 16u +
             dim * 16u);
       }
@@ -592,24 +593,31 @@ __launch_bounds__(256, (__clang_major__ >= 24 && kHeadMajor) ? 6 : 2) __global__
   }
 }
 
-// FFN scratch is idle during attention. Keep K head-major and transpose each
-// 16-key V tile into the layout consumed by WMMA. Persistent KV is unchanged.
-__global__ void PackAttentionHeads(const __half* keys, const __half* values,
-                                   __half* packed_keys, __half* packed_values,
-                                   std::uint32_t length) {
+// The packed cache: K head-major, V transposed in tiles of 16 positions, the
+// layout WMMA consumes. Heads sit `capacity` positions apart (a multiple of
+// 16), so no row moves when the prompt grows and a chunk packs only its own
+// rows. `keys` and `values` hold positions [first, length) as
+// [position][head][dim]. A tile that starts before `first` keeps the columns
+// it already has; positions from `length` on are zero.
+__global__ void PackAttentionRows(const __half* keys, const __half* values,
+                                  __half* packed_keys, __half* packed_values,
+                                  std::uint32_t first, std::uint32_t length,
+                                  std::uint32_t capacity) {
   __shared__ __half tile[16][kHeadDim + 8];
   // Adjacent blocks read adjacent heads of the same source token tile.
-  const std::uint32_t head = blockIdx.x, base = blockIdx.y * 16;
+  const std::uint32_t head = blockIdx.x;
+  const std::uint32_t base = (first & ~15u) + blockIdx.y * 16;
   for (std::uint32_t i = threadIdx.x; i < 16 * kHeadDim / 8; i += 256) {
     const std::uint32_t key = i / (kHeadDim / 8);
     const std::uint32_t dim = (i % (kHeadDim / 8)) * 8;
     uint4 value = make_uint4(0, 0, 0, 0);
-    if (base + key < length) {
+    if (base + key >= first && base + key < length) {
       const auto src =
-          (static_cast<std::size_t>(base + key) * kKvHeads + head) * kHeadDim +
+          (static_cast<std::size_t>(base + key - first) * kKvHeads + head) *
+              kHeadDim +
           dim;
       const auto dst =
-          (static_cast<std::size_t>(head) * length + base + key) * kHeadDim +
+          (static_cast<std::size_t>(head) * capacity + base + key) * kHeadDim +
           dim;
       *reinterpret_cast<uint4*>(packed_keys + dst) =
           *reinterpret_cast<const uint4*>(keys + src);
@@ -618,42 +626,92 @@ __global__ void PackAttentionHeads(const __half* keys, const __half* values,
     *reinterpret_cast<uint4*>(&tile[key][dim]) = value;
   }
   __syncthreads();
-  const std::size_t padded = (length + 15u) & ~std::size_t{15};
   for (std::uint32_t i = threadIdx.x; i < 16 * kHeadDim / 8; i += 256) {
     const std::uint32_t dim = i / 2, key = (i % 2) * 8;
+    auto* dst = reinterpret_cast<uint4*>(
+        packed_values +
+        (static_cast<std::size_t>(head) * capacity + base) * kHeadDim +
+        dim * 16 + key);
     union {
       uint4 packed;
       __half halves[8];
     } value;
+    value.packed = make_uint4(0, 0, 0, 0);
+    if (base < first)
+      value.packed = *dst;
 #pragma unroll
     for (std::uint32_t j = 0; j < 8; ++j)
-      value.halves[j] = tile[key + j][dim];
-    *reinterpret_cast<uint4*>(
-        packed_values + static_cast<std::size_t>(head) * padded * kHeadDim +
-        static_cast<std::size_t>(base) * kHeadDim + dim * 16 + key) =
-        value.packed;
+      if (base + key + j >= first)
+        value.halves[j] = tile[key + j][dim];
+    *dst = value.packed;
   }
 }
 
-
 }  // namespace gufo::hip
 
+namespace {
+
+constexpr unsigned kBlock = 256;
+
+// Wait for the launches with the calling thread awake. Asleep in the driver
+// every core idles, and on a Ryzen AI Max+ 395 the attention kernel then runs
+// a quarter slower at the same package power: 150 ms against 112 ms for 2048
+// rows over 61K positions.
+void WaitAwake() {
+  hipEvent_t done;
+  if (hipEventCreate(&done) != hipSuccess) {
+    (void)hipDeviceSynchronize();
+    return;
+  }
+  if (hipEventRecord(done, nullptr) == hipSuccess) {
+    while (hipEventQuery(done) == hipErrorNotReady) {
+    }
+  }
+  (void)hipEventDestroy(done);
+  (void)hipDeviceSynchronize();
+}
+
+dim3 AttentionGrid(unsigned batch) { return dim3((batch + 31u) / 32u, 4u * 3u); }
+
+void Pack(const __half* k, const __half* v, __half* packed_k, __half* packed_v,
+          unsigned first, unsigned length, unsigned capacity) {
+  const unsigned tiles = (length + 15u) / 16u - first / 16u;
+  gufo::hip::PackAttentionRows<<<dim3(4u, tiles), kBlock>>>(
+      k, v, packed_k, packed_v, first, length, capacity);
+}
+
+}  // namespace
+
+// One call over arrays it packs itself. `k` and `v` are [length][4][256];
+// the packed scratch holds 4 heads of `length` rounded up to 16 positions.
 extern "C" void omlx_gufo_attention(
     const float* q, const __half* k, const __half* v, float* out,
     __half* packed_k, __half* packed_v, unsigned start_pos, unsigned batch,
     int packed) {
-  constexpr unsigned heads_kv = 4;
-  constexpr unsigned block = 256;
   const unsigned length = start_pos + batch;
-  const dim3 grid((batch + 31u) / 32u, heads_kv * 3u);
   if (packed) {
-    gufo::hip::PackAttentionHeads<<<dim3(heads_kv, (length + 15u) / 16u), block>>>(
-        k, v, packed_k, packed_v, length);
-    gufo::hip::WmmaCausalAttention<32, 16, true><<<grid, block>>>(
-        q, nullptr, packed_k, packed_v, out, start_pos, batch, nullptr, 0, 0);
+    const unsigned capacity = (length + 15u) & ~15u;
+    Pack(k, v, packed_k, packed_v, 0, length, capacity);
+    gufo::hip::WmmaCausalAttention<32, 16, true><<<AttentionGrid(batch), kBlock>>>(
+        q, nullptr, packed_k, packed_v, out, start_pos, batch, nullptr, 0, 0,
+        capacity);
   } else {
-    gufo::hip::WmmaCausalAttention<32, 16, false><<<grid, block>>>(
-        q, nullptr, k, v, out, start_pos, batch, nullptr, 0, 0);
+    gufo::hip::WmmaCausalAttention<32, 16, false><<<AttentionGrid(batch), kBlock>>>(
+        q, nullptr, k, v, out, start_pos, batch, nullptr, 0, 0, 0);
   }
-  hipDeviceSynchronize();
+  WaitAwake();
+}
+
+// The same attention over a packed cache that outlives the call. `k` and `v`
+// hold positions [first, start_pos + batch) as [position][4][256]; they join
+// the cache before the last `batch` positions attend over all of it.
+extern "C" void omlx_gufo_attention_cached(
+    const float* q, const __half* k, const __half* v, float* out,
+    __half* packed_k, __half* packed_v, unsigned first, unsigned start_pos,
+    unsigned batch, unsigned capacity) {
+  Pack(k, v, packed_k, packed_v, first, start_pos + batch, capacity);
+  gufo::hip::WmmaCausalAttention<32, 16, true><<<AttentionGrid(batch), kBlock>>>(
+      q, nullptr, packed_k, packed_v, out, start_pos, batch, nullptr, 0, 0,
+      capacity);
+  WaitAwake();
 }

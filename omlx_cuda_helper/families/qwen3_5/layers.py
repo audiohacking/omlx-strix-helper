@@ -79,9 +79,15 @@ class GatedDeltaNet:
         self.norm_weight = w["norm.weight"]
         self.conv = causal_conv
         self._gdn = None
-        # HIP kernels for the steps around the recurrence.
-        self._conv_silu = None
-        self._gate_mul = None
+        # HIP kernels for the steps around the recurrence: the two steps
+        # whole (``_conv_norm``, ``_norm_gate``), or only their elementwise
+        # part for a head width the norm kernels do not take.
+        self._conv_norm = self._norm_gate = None
+        self._conv_silu = self._gate_mul = None
+        # L2 norm as an RMS norm; the query also takes the 1/sqrt(dim) of
+        # the readout. Both scales multiply the rounded norm.
+        self._scale = self.key_dim**-0.5
+        self._norm_eps = 1e-6 * self._scale**2
 
     def enable_kernels(self) -> None:
         """Use the conv kernel if it equals ``causal_conv`` on these taps."""
@@ -109,31 +115,45 @@ class GatedDeltaNet:
             self._enable_recurrence()
 
     def _enable_glue(self) -> None:
-        """Take the conv and gate kernels if they equal the plain ops."""
+        """Take the kernels around the recurrence that equal the plain ops."""
         dtype = self.qkv.weight.dtype
         width = self.taps.shape[1] - 1
         # Three chunks: a zero window, a carried one, and one shorter than it.
-        window = None
-        try:
-            for rows in (64, 37, width - 1):
-                x = (3.0 * mx.random.normal((1, rows, self.taps.shape[0]))).astype(dtype)
-                shown = window
-                if shown is None:
-                    shown = mx.zeros((1, width, x.shape[-1]), dtype=dtype)
-                conv_in = mx.concatenate([shown, x], axis=1)
-                want = nn.silu(causal_conv(conv_in, self.taps))
-                if not mx.array_equal(kernels.conv_silu(shown, x, self.taps), want).item():
-                    raise ValueError("the conv kernel differs")
-                window = conv_in[:, rows:]
-            y = (3.0 * mx.random.normal((1, 64, self.value_heads, self.value_dim))).astype(dtype)
-            z = (4.0 * mx.random.normal(y.shape)).astype(dtype)
-            want = (nn.silu(z.astype(mx.float32)) * y.astype(mx.float32)).astype(dtype)
-            if not mx.array_equal(kernels.gate_mul(y, z), want).item():
-                raise ValueError("the gate kernel differs")
-        except Exception as e:
-            kernels.logger.warning("Linear layer kernels off, using plain ops: %s", e)
-            return
-        self._conv_silu, self._gate_mul = kernels.conv_silu, kernels.gate_mul
+        chunks = [
+            (3.0 * mx.random.normal((1, rows, self.taps.shape[0]))).astype(dtype)
+            for rows in (64, 37, width - 1)
+        ]
+        y = 3.0 * mx.random.normal((1, 64, self.value_heads, self.value_dim))
+        y = y.astype(dtype)
+        z = (4.0 * mx.random.normal((1, 64, self.value_heads * self.value_dim)))
+        z = z.astype(dtype)
+
+        def run() -> list[mx.array]:
+            window, out = None, []
+            for x in chunks:
+                *heads, window = self.prework(x, window)
+                out += [*heads, window]
+            return [*out, self.finish(y, z)]
+
+        def use(conv_norm=None, norm_gate=None, conv_silu=None, gate_mul=None):
+            self._conv_norm, self._norm_gate = conv_norm, norm_gate
+            self._conv_silu, self._gate_mul = conv_silu, gate_mul
+
+        use()
+        want = run()
+        choices = [{"conv_silu": kernels.conv_silu, "gate_mul": kernels.gate_mul}]
+        if self.key_dim == self.value_dim == kernels.NORM_DIM:
+            whole = {"conv_norm": kernels.conv_norm, "norm_gate": kernels.norm_gate}
+            choices.insert(0, whole)
+        for choice in choices:
+            use(**choice)
+            try:
+                if all(mx.array_equal(a, b).item() for a, b in zip(run(), want)):
+                    return
+                kernels.logger.warning("Kernels %s differ from plain ops", list(choice))
+            except Exception:
+                kernels.logger.warning("Kernels %s failed", list(choice), exc_info=True)
+        use()
 
     def _enable_recurrence(self) -> None:
         """Use the HIP gated-delta kernel when it matches the mlx recurrence.
@@ -183,25 +203,29 @@ class GatedDeltaNet:
             width = self.taps.shape[1] - 1
             window = mx.zeros((1, width, qkv.shape[-1]), dtype=qkv.dtype)
         width = window.shape[1]
-        if self._conv_silu is None:
+        keys = self.key_heads * self.key_dim
+        scale, eps = self._scale, self._norm_eps
+        if self._conv_norm is None and self._conv_silu is None:
             conv_in = mx.concatenate([window, qkv], axis=1)
             conv_out = nn.silu(self.conv(conv_in, self.taps))
             window = conv_in[:, rows:]
         else:
-            conv_out = self._conv_silu(window, qkv, self.taps)
             if rows >= width:
-                window = qkv[:, rows - width :]
+                carried = qkv[:, rows - width :]
             else:
-                window = mx.concatenate([window, qkv], axis=1)[:, rows:]
-        keys = self.key_heads * self.key_dim
+                carried = mx.concatenate([window, qkv], axis=1)[:, rows:]
+            if self._conv_norm is not None:
+                scales = mx.array([scale**2, scale])
+                q, k, v = self._conv_norm(
+                    window, qkv, self.taps, keys, scales, mx.array([eps])
+                )
+                return q, k, v, mx.contiguous(carried)
+            conv_out = self._conv_silu(window, qkv, self.taps)
+            window = carried
         q = conv_out[..., :keys].reshape(1, rows, self.key_heads, self.key_dim)
         k = conv_out[..., keys : 2 * keys].reshape(q.shape)
         v = conv_out[..., 2 * keys :]
         v = v.reshape(1, rows, self.value_heads, self.value_dim)
-        # L2 norm as an RMS norm; the query also takes the 1/sqrt(dim) of
-        # the readout. Both scales multiply the rounded norm.
-        scale = self.key_dim**-0.5
-        eps = 1e-6 * scale**2
         q = (scale**2) * mx.fast.rms_norm(q, None, eps)
         k = scale * mx.fast.rms_norm(k, None, eps)
         return q, k, v, mx.contiguous(window)
@@ -216,6 +240,9 @@ class GatedDeltaNet:
         For an oQh out_proj it is the rotated output: the host rotates the
         float32 gated value and rounds once.
         """
+        if self._norm_gate is not None and self.out.rotation is None:
+            gated = self._norm_gate(y, z, self.norm_weight, mx.array([self.eps]))
+            return gated.reshape(1, y.shape[1], -1)
         y = mx.fast.rms_norm(y, self.norm_weight, self.eps)
         if self.out.rotation is not None:
             rows = (1, y.shape[1], -1)
@@ -248,23 +275,53 @@ class KVCache:
     """Rotated keys and values of one attention layer for one prompt."""
 
     def __init__(self) -> None:
-        self.keys: mx.array | None = None
-        self.values: mx.array | None = None
+        # (keys, values) of each chunk, joined only when something reads them
+        # whole: a prompt's rows are otherwise copied again every chunk.
+        self._chunks: list[tuple[mx.array, mx.array]] = []
         self.offset = 0
         # (keys, values) of the last chunk.
         self.appended: tuple[mx.array, ...] = ()
+        # The same rows in the layout of the WMMA kernel, once it serves them.
+        self.packed: kernels.PackedCache | None = None
 
     def append(self, keys: mx.array, values: mx.array) -> None:
         """Add rows [1, kv heads, n, dim]."""
         self.appended = (keys, values)
-        if self.keys is not None:
-            keys = mx.concatenate([self.keys, keys], axis=2)
-            values = mx.concatenate([self.values, values], axis=2)
-        self.keys, self.values = keys, values
-        self.offset = keys.shape[2]
+        self._chunks.append((keys, values))
+        self.offset += keys.shape[2]
+
+    def _joined(self) -> tuple[mx.array, mx.array]:
+        if len(self._chunks) > 1:
+            keys, values = zip(*self._chunks)
+            joined = mx.concatenate(keys, axis=2), mx.concatenate(values, axis=2)
+            self._chunks = [joined]
+        return self._chunks[0]
+
+    @property
+    def keys(self) -> mx.array:
+        return self._joined()[0]
+
+    @property
+    def values(self) -> mx.array:
+        return self._joined()[1]
+
+    def since(self, position: int) -> tuple[mx.array, mx.array]:
+        """(keys, values) of the rows from ``position`` on."""
+        start, parts = self.offset, []
+        for keys, values in reversed(self._chunks):
+            if start <= position:
+                break
+            start -= keys.shape[2]
+            cut = max(position - start, 0)
+            parts.append((keys[:, :, cut:], values[:, :, cut:]))
+        if len(parts) == 1:
+            return parts[0]
+        keys, values = zip(*reversed(parts))
+        return mx.concatenate(keys, axis=2), mx.concatenate(values, axis=2)
 
     def arrays(self) -> list[mx.array]:
-        return [a for a in (self.keys, self.values) if a is not None]
+        packed = self.packed.arrays() if self.packed is not None else []
+        return [a for chunk in self._chunks for a in chunk] + packed
 
 
 def rotary_frequencies(text: dict[str, Any]) -> mx.array:
@@ -343,6 +400,22 @@ class Attention:
         # stays on MLX; this one is the 24/4/256 kernel that holds its pace.
         self._gufo = self.fused and kernels.gufo_ready()
 
+    def attend_cache(self, queries: mx.array, cache: KVCache) -> mx.array:
+        """``attend`` for the newest rows of ``cache`` over all of it.
+
+        The WMMA kernel keeps its own packed copy of the cache and adds the
+        rows it has not seen; a cache it cannot serve goes to ``attend``.
+        """
+        if self.fused and self._gufo:
+            packed = cache.packed or kernels.PackedCache()
+            new = cache.since(packed.length)
+            out = kernels.gufo_cached(queries, packed, *new, cache.offset)
+            if out is not None:
+                cache.packed = packed
+                return out
+            cache.packed = None
+        return self.attend(queries, cache.keys, cache.values)
+
     def attend(
         self, queries: mx.array, keys: mx.array, values: mx.array, step: int = 0
     ) -> mx.array:
@@ -409,7 +482,7 @@ class Attention:
         positions = mx.arange(cache.offset, cache.offset + rows, dtype=mx.int32)
         queries = rotate(queries, positions, frequencies)
         cache.append(rotate(keys, positions, frequencies), values.transpose(0, 2, 1, 3))
-        output = self.attend(queries, cache.keys, cache.values)
+        output = self.attend_cache(queries, cache)
         gate = mx.sigmoid(gate.reshape(1, rows, -1))
         return self.o_proj(output.reshape(1, rows, -1) * gate)
 
