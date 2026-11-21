@@ -11,13 +11,29 @@ The numbers in the README are this setup. Qwen3.8 27B oQ4e, 65,536-token prompt,
 
 ## The cable
 
-The inference path is a Thunderbolt bridge, not the shared Ethernet.
+Prefill crosses one cable. A direct 10G link, or both machines on a 10G switch, is the one to use when it exists. It reports a real media speed, stock oMLX will select it, and it can be faster than the bridge. The README row was measured on the Thunderbolt bridge because that was the fast cable on this desk.
 
-The Halo's Thunderbolt interface negotiates 80 Gbit/s and has no DHCP lease. The Mac reaches it at that interface's IPv6 link-local address, scoped to `bridge0`. The member port (Thunderbolt 6 on this Mac) is in the bridge and has no address of its own. `ifconfig` reports `media: autoselect` for the bridge, with no `1000baseT`-style speed.
+```mermaid
+flowchart LR
+  Mac["M3 Ultra\noMLX · decode, KV, API"]
+  Halo["Strix Halo\nprefill · layers 0…K"]
 
-Stock oMLX discovers the helper on the network both machines share and stays there. It drops 169.254 addresses, and it only ranks interfaces that report a numeric media speed, so a bridge never wins against gigabit. The fork ranks that bridge by the speed the Halo reports for the cable.
+  Mac -->|"preferred\ndirect 10G cable,\nor a 10G switch"| Halo
+  Mac -->|"otherwise\nThunderbolt bridge\nlink-local on bridge0"| Halo
+  Mac -.->|"shared 1G LAN\ndiscovery, not prefill"| Halo
 
-After Pair, Check has to show the bridge link-local and **80000 Mbit/s**. A pass on a 1000 Mbit/s Ethernet address is the wrong cable. Unscoped 169.254 traffic follows whichever interface already owns that route; do not send the cable's traffic out the gigabit port.
+  class Mac,Halo machine
+  classDef machine fill:#f4f1ea,stroke:#243026,color:#1c1915,stroke-width:1.5px
+  linkStyle 0 stroke:#1f7a4d,stroke-width:2.5px
+  linkStyle 1 stroke:#8a6a2f,stroke-width:1.75px
+  linkStyle 2 stroke:#9a9a9a,stroke-dasharray:4 3
+```
+
+The Halo's Thunderbolt interface negotiates 80 Gbit/s and has no DHCP lease. The Mac reaches it at that interface's IPv6 link-local address, scoped to `bridge0`. The member port is in the bridge and has no address of its own. `ifconfig` reports `media: autoselect` for the bridge, with no `1000baseT`-style speed.
+
+Stock oMLX discovers the helper on the network both machines share and stays there. It drops 169.254 addresses, and it only ranks interfaces that report a numeric media speed, so a bridge never wins against gigabit. A 10G port does report a speed, which is why that path needs no fork. The fork ranks the bridge by the 80 Gbit/s the Halo reports. While the bridge answers, that rank beats a 10G NIC, so leave the bridge down when the 10G path is the one you want.
+
+After Pair, Check shows the cable actually in use. On 10G that is the 10G address at **10000 Mbit/s**. On the bridge it is the link-local address at **80000 Mbit/s**. A pass on a 1000 Mbit/s Ethernet address is the wrong cable. Unscoped 169.254 traffic follows whichever interface already owns that route; do not send the cable's traffic out the gigabit port.
 
 This helper reports version 0.1.6. The fork's check expects 0.1.7 and warns. The warning does not stop prefill. The family row is `qwen3_5`.
 
@@ -80,4 +96,4 @@ State lives in `~/.omlx-cuda-helper`. Pass `--pair` only for a helper that is no
 
 Balanced firmware, the bridge at 80 Gbit/s, native bf16, ANE and MTP on, hipBLASLt for the linears, one packed attention launch per full-attention layer. Auto picks how the 64 layers split. The link is tens of milliseconds. The Mac's remaining layers are the long pole when the bridge is the cable.
 
-A repeat of the 64K prompt on that path lands on the README row. Treat a result near 300 tok/s as the gigabit port, or as the helper having been dropped, and check the cable before changing a kernel.
+A repeat of the 64K prompt on that bridge lands on the README row. A 10G cable or a 10G switch is the preferred substitute, and it can come out ahead of the bridge; there is no 10G row in the table yet. Treat a result near 300 tok/s as the gigabit port, or as the helper having been dropped, and check the cable before changing a kernel.
