@@ -1,4 +1,5 @@
-name: Release image
+# Publishes the Strix helper image. This workflow does not build oMLX.
+name: Release helper image
 
 on:
   release:

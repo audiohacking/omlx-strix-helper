@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
 # SPDX-License-Identifier: Apache-2.0
-# omlx-strix-helper for linux/amd64 (Strix Halo, gfx1151). Build from this folder:
+# The Strix helper only, the alternative to omlx-cuda-helper.
+# This image does not build or run the oMLX server. It builds MLX
+# (ml-explore/mlx), the array library the worker imports.
 #   docker build -t omlx-strix-helper .
 ARG ROCM=10.3.0a20261120
 ARG ROCM_INDEX=https://nightly.repo.amd.com/rocm/whl-next/

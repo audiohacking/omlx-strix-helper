@@ -39,7 +39,7 @@ This helper reports version 0.1.6. The fork's check expects 0.1.7 and warns. The
 
 ## Mac
 
-Install from source, the same way as upstream oMLX, against the fork:
+oMLX runs here and is not part of this repo. This repo builds the helper only. The Mac needs the [audiohacking/omlx](https://github.com/audiohacking/omlx) fork so it will select a Thunderbolt bridge; stock oMLX is fine when the cable is 10G. Install that fork the same way as upstream oMLX:
 
 ```bash
 git clone https://github.com/audiohacking/omlx.git
@@ -62,7 +62,7 @@ Decode stays on the Mac either way. The helper never decodes.
 
 ## Halo
 
-The zero-friction install is the container. A release of this repo builds `ghcr.io/audiohacking/omlx-strix-helper` for gfx1151 and pushes it. On the Halo:
+The container is this worker only, the alternative to `jundot/omlx-cuda-helper`. A release of this repo builds that image and nothing else: oMLX is not in it, and the release action does not build oMLX. On the Halo:
 
 ```bash
 docker run -d --name omlx-helper --restart unless-stopped \
@@ -74,7 +74,7 @@ docker run -d --name omlx-helper --restart unless-stopped \
 docker logs -f omlx-helper
 ```
 
-The image is the same helper as the source build below: ROCm SDK `10.3.0a20261120`, MLX `fc344c9` with the gfx1151 ROCm overlay, and `libgufo_attn.so` already compiled. The volume is the helper's state. Pass `--name halo` after the image name to set the Cluster tab name.
+Inside the image is the helper process: ROCm SDK `10.3.0a20261120`, the MLX library at `fc344c9` with the gfx1151 ROCm overlay, and `libgufo_attn.so` already compiled. MLX here is the array library, not the oMLX server. The volume is the helper's state. Pass `--name halo` after the image name to set the Cluster tab name.
 
 The worker speaks the CUDA helper protocol on purpose: `control` is `agent`, `backends` is `["cuda"]`, discovery is `_omlx._tcp.local.`, ports are 8850 (http), 8851 (control), and 8852 (data). The import package is `omlx_cuda_helper`. The only served family is `qwen3_5`.
 

@@ -51,7 +51,9 @@ The supported family is `qwen3_5`.
 
 ## Run with Docker
 
-`ghcr.io/audiohacking/omlx-strix-helper` is linux/amd64, built for gfx1151. A published release builds and pushes it. The Halo needs a ROCm-capable kernel and the render devices passed through:
+This image is the helper, not oMLX. oMLX stays on the Mac. The image is the Strix Halo alternative to [`jundot/omlx-cuda-helper`](https://github.com/jundot/omlx/blob/main/apps/omlx-cuda-helper/README.md): same discovery, pairing, ports, and data frames, and it does not contain the oMLX server.
+
+`ghcr.io/audiohacking/omlx-strix-helper` is linux/amd64 for gfx1151. A release of **this** repo builds and pushes it. The Halo needs a ROCm-capable kernel and the render devices passed through:
 
 ```bash
 docker run -d --name omlx-helper --restart unless-stopped \
@@ -65,7 +67,9 @@ docker logs -f omlx-helper
 
 Host networking is what lets the Cluster tab find the helper. The volume holds the identity, the pairings, the model files oMLX copies over, and the kernel cache. Arguments after the image name go to `serve`, for example `--name halo`.
 
-To update, run `docker pull ghcr.io/audiohacking/omlx-strix-helper`, then `docker rm -f omlx-helper` and the same `docker run`. The volume keeps the pairing and the model files. The first push is private until the package is made public in the repository settings.
+To update, run `docker pull ghcr.io/audiohacking/omlx-strix-helper`, then `docker rm -f omlx-helper` and the same `docker run`. The volume keeps the pairing and the model files. Other commands run in the container, for example `docker exec omlx-helper omlx-strixworker --state-dir /data status`. The first push is private until the package is made public in the repository settings.
+
+To build the image yourself, run `docker build -t omlx-strix-helper .` in this folder. That compiles the worker and the MLX library it imports (`mlx-build/`, the ROCm counterpart of the CUDA helper's `mlx-build/`). It does not clone or build oMLX.
 
 ## Build
 
