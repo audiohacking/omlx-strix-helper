@@ -62,6 +62,20 @@ Decode stays on the Mac either way. The helper never decodes.
 
 ## Halo
 
+The zero-friction install is the container. A release of this repo builds `ghcr.io/audiohacking/omlx-strix-helper` for gfx1151 and pushes it. On the Halo:
+
+```bash
+docker run -d --name omlx-helper --restart unless-stopped \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add video --group-add render \
+  --network host --ipc host \
+  -v omlx-helper:/data \
+  ghcr.io/audiohacking/omlx-strix-helper
+docker logs -f omlx-helper
+```
+
+The image is the same helper as the source build below: ROCm SDK `10.3.0a20261120`, MLX `fc344c9` with the gfx1151 ROCm overlay, and `libgufo_attn.so` already compiled. The volume is the helper's state. Pass `--name halo` after the image name to set the Cluster tab name.
+
 The worker speaks the CUDA helper protocol on purpose: `control` is `agent`, `backends` is `["cuda"]`, discovery is `_omlx._tcp.local.`, ports are 8850 (http), 8851 (control), and 8852 (data). The import package is `omlx_cuda_helper`. The only served family is `qwen3_5`.
 
 The measured stack is MLX `fc344c9` with the mlxcel ROCm overlay and ROCm `10.3.0a20261120`. Two patches in this repo belong on that build:

@@ -49,6 +49,24 @@ Two kernels carry that prefix.
 
 The supported family is `qwen3_5`.
 
+## Run with Docker
+
+`ghcr.io/audiohacking/omlx-strix-helper` is linux/amd64, built for gfx1151. A published release builds and pushes it. The Halo needs a ROCm-capable kernel and the render devices passed through:
+
+```bash
+docker run -d --name omlx-helper --restart unless-stopped \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add video --group-add render \
+  --network host --ipc host \
+  -v omlx-helper:/data \
+  ghcr.io/audiohacking/omlx-strix-helper
+docker logs -f omlx-helper
+```
+
+Host networking is what lets the Cluster tab find the helper. The volume holds the identity, the pairings, the model files oMLX copies over, and the kernel cache. Arguments after the image name go to `serve`, for example `--name halo`.
+
+To update, run `docker pull ghcr.io/audiohacking/omlx-strix-helper`, then `docker rm -f omlx-helper` and the same `docker run`. The volume keeps the pairing and the model files. The first push is private until the package is made public in the repository settings.
+
 ## Build
 
 The attention library is a gfx1151 binary and stays out of git. Build it on the Halo:

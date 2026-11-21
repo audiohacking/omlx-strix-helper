@@ -1,0 +1,4 @@
+patches/0001-rocm-gfx1151.patch is the mlxcel ROCm overlay
+(https://github.com/lablup/mlxcel, MIT) on MLX fc344c9
+(https://github.com/ml-explore/mlx, MIT), including the gfx1151 fixes
+also kept on their own in ../patches.

@@ -22,3 +22,6 @@ omlx-strixworker = "omlx_cuda_helper.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["omlx_cuda_helper*"]
+
+[tool.setuptools.package-data]
+omlx_cuda_helper = ["**/*.so"]
