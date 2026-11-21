@@ -156,10 +156,21 @@ class Stage:
         return h, state, kept
 
     def enable_kernels(self) -> None:
-        """Take the CUDA kernels whose results match the plain-ops reference."""
+        """Take kernels whose results match the plain-ops reference."""
         if kernels.available():
             for layer in self.layers:
                 layer.enable_kernels()
+        elif kernels.hip_jit():
+            # Every linear layer has the same head shape, so the slow
+            # reference comparison runs once and the rest reuse the kernel.
+            gdn = None
+            for layer in self.layers:
+                if layer.linear and gdn is not None:
+                    layer.mixer._gdn = gdn
+                    continue
+                layer.enable_rocm()
+                if layer.linear:
+                    gdn = layer.mixer._gdn
 
     def warm(self, tokens: int) -> float:
         self.enable_kernels()

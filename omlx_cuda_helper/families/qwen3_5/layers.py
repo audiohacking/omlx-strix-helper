@@ -24,6 +24,10 @@ from . import kernels
 _SHEET_BYTES = 1 << 30
 
 
+def _close(got: mx.array, want: mx.array, rtol: float, atol: float) -> bool:
+    return bool(mx.allclose(got, want, rtol=rtol, atol=atol).item())
+
+
 class Weights:
     """Lazy checkpoint tensors under one name prefix, with their quantization."""
 
@@ -74,6 +78,7 @@ class GatedDeltaNet:
         self.dt_bias = w["dt_bias"]
         self.norm_weight = w["norm.weight"]
         self.conv = causal_conv
+        self._gdn = None
 
     def enable_kernels(self) -> None:
         """Use the conv kernel if it equals ``causal_conv`` on these taps."""
@@ -85,6 +90,42 @@ class GatedDeltaNet:
             self.conv = kernels.causal_conv
         else:
             kernels.logger.warning("Causal conv kernel differs; using the reference")
+
+    def enable_rocm(self) -> None:
+        """Use the HIP gated-delta kernel when it matches the mlx recurrence.
+
+        The check is a short sequence. The op it is checked against expands
+        into one graph per token, which is the path this kernel replaces.
+        """
+
+        if not kernels.hip_jit():
+            return
+        dtype = self.qkv.weight.dtype
+        b, t = 1, 16
+        hk, hv = self.key_heads, self.value_heads
+        dk, dv = self.key_dim, self.value_dim
+        # Small values: a full-scale normal state overflows the recurrence and
+        # the comparison then rejects a kernel that matches on real prompts.
+        q = (0.1 * mx.random.normal(shape=(b, t, hk, dk))).astype(dtype)
+        k = (0.1 * mx.random.normal(shape=(b, t, hk, dk))).astype(dtype)
+        v = (0.1 * mx.random.normal(shape=(b, t, hv, dv))).astype(dtype)
+        g = mx.exp(-nn.softplus(mx.random.normal(shape=(b, t, hv))))
+        beta = nn.sigmoid(mx.random.normal(shape=(b, t, hv)))
+        state = 0.01 * mx.random.normal(shape=(b, hv, dv, dk))
+        try:
+            plain_y, plain_s = mx.fast.gated_delta_update(q, k, v, g, beta, state)
+            fast = kernels.gated_delta(q, k, v, g, beta, state)
+            if fast is None:
+                return
+            fast_y, fast_s = fast
+            ok = _close(plain_y, fast_y, 1e-3, 1e-3) and _close(plain_s, fast_s, 1e-3, 1e-3)
+        except Exception:
+            kernels.logger.warning("Gated-delta kernel failed; using the reference", exc_info=True)
+            return
+        if ok:
+            self._gdn = kernels.gated_delta
+        else:
+            kernels.logger.warning("Gated-delta kernel differs; using the reference")
 
     def parameters(self) -> list[mx.array]:
         linears = (self.qkv, self.z, self.b, self.a, self.out)
@@ -137,7 +178,13 @@ class GatedDeltaNet:
         rot = self.qkv.rotated(x) if rot is None else rot
         q, k, v, cache[0] = self.prework(self.qkv(x, rot), cache[0])
         gamma, beta = self.gates(self.a(x, rot), self.b(x, rot))
-        y, cache[1] = mx.fast.gated_delta_update(q, k, v, gamma, beta, cache[1])
+        updated = None
+        if self._gdn is not None:
+            updated = self._gdn(q, k, v, gamma, beta, cache[1])
+        if updated is None:
+            y, cache[1] = mx.fast.gated_delta_update(q, k, v, gamma, beta, cache[1])
+        else:
+            y, cache[1] = updated
         finished = self.finish(y, self.z(x, rot))
         return self.out(finished, finished if self.out.rotation is not None else None)
 
@@ -211,6 +258,7 @@ class Attention:
         self.q_norm = w["q_norm.weight"]
         self.k_norm = w["k_norm.weight"]
         self.fused = False
+        self._gufo = False
 
     def parameters(self) -> list[mx.array]:
         linears = (self.q_proj, self.k_proj, self.v_proj, self.o_proj)
@@ -231,6 +279,12 @@ class Attention:
         if not kernels.attention_matches(self.attend(queries, keys, values), want):
             self.fused = False
 
+    def enable_rocm(self) -> None:
+        self.enable_kernels()
+        # Gufo's kernel is the long-context path. The small fused check above
+        # stays on MLX; this one is the 24/4/256 kernel that holds its pace.
+        self._gufo = self.fused and kernels.gufo_ready()
+
     def attend(
         self, queries: mx.array, keys: mx.array, values: mx.array, step: int = 0
     ) -> mx.array:
@@ -249,6 +303,10 @@ class Attention:
         # Exact for a head width that is a power of four; else it moves the
         # float32 scores by less than their own rounding.
         scale = 1.0 / math.sqrt(dim)
+        if self.fused and self._gufo:
+            out = kernels.gufo_attention(queries, keys, values)
+            if out is not None:
+                return out
         if self.fused:
             out = mx.fast.scaled_dot_product_attention(
                 queries, keys, values, scale=scale, mask="causal"
@@ -323,6 +381,9 @@ class Layer:
     def enable_kernels(self) -> None:
         """Switch the mixer to the CUDA kernels that pass their self-check."""
         self.mixer.enable_kernels()
+
+    def enable_rocm(self) -> None:
+        self.mixer.enable_rocm()
 
     def new_cache(self) -> Any:
         return [None, None] if self.linear else KVCache()

@@ -1,0 +1,32 @@
+--- a/mlx/backend/cuda/no_cuda.cpp
++++ b/mlx/backend/cuda/no_cuda.cpp
+@@ -21,13 +21,21 @@ namespace fast {
+ 
+ CustomKernelFunction cuda_kernel(
+-    const std::string&,
+-    const std::vector<std::string>&,
+-    const std::vector<std::string>&,
+-    const std::string&,
+-    const std::string&,
+-    bool,
+-    int) {
+-  throw std::runtime_error("[cuda_kernel] No CUDA back-end.");
++    const std::string& name,
++    const std::vector<std::string>& input_names,
++    const std::vector<std::string>& output_names,
++    const std::string& source,
++    const std::string& header,
++    bool ensure_row_contiguous,
++    int shared_memory) {
++  // Python binds cuda_kernel. On this ROCm build the JIT is hip_kernel.
++  return hip_kernel(
++      name,
++      input_names,
++      output_names,
++      source,
++      header,
++      ensure_row_contiguous,
++      shared_memory);
+ }
+ 
+ std::vector<array> precompiled_cuda_kernel(
