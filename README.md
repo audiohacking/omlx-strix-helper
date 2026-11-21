@@ -9,7 +9,7 @@ oMLX 0.8.0 hands the front of a long prompt to a second GPU and keeps decode, th
 
 The package name is `omlx_cuda_helper`, so the oMLX protocol tests import it unchanged. In an oMLX tree it lives at `apps/omlx-strixworker`.
 
-M3 Ultra, one Strix Halo, Thunderbolt. Find devices, Pair, and Check:
+M3 Ultra, one Strix Halo, Thunderbolt. Find devices, Pair, and Check. The cable has to be the bridge; the setup is in [DEMO.md](DEMO.md).
 
 <img width="1130" height="644" alt="image" src="https://github.com/user-attachments/assets/85a1424a-5e0e-4ff4-94d1-4e2dde91eb0e" />
 
@@ -29,9 +29,9 @@ Same model, 64K prompt, M3 Ultra 512 GB. The Spark and A6000 rows are the oMLX 0
 | 64K prefill | tok/s |
 | --- | ---: |
 | M3 Ultra alone | 352 |
-| DGX Spark | 1,062 |
-| 2× RTX A6000 | 1,879 |
-| Strix Halo | 710 |
+| + Strix Halo | 710 |
+| + DGX Spark | 1,062 |
+| + 2× RTX A6000 | 1,879 |
 
 At 32,768 tokens the draft copies 94 of 98 eligible prompt tokens, and decode reads 165 tok/s. At 65,536 the Mac drafts new tokens at 67 tok/s.
 
