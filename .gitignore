@@ -5,3 +5,4 @@ __pycache__/
 dist/
 build/
 libgufo_attn.so
+.rocprofv3/
