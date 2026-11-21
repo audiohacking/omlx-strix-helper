@@ -19,7 +19,8 @@ RUN python3 -m venv /opt/helper \
     && /opt/helper/bin/pip install --no-cache-dir -U pip setuptools wheel
 ENV PATH=/opt/helper/bin:$PATH
 # The gfx1151 device library is a wheel. hipcc does not need a GPU to target it.
-RUN pip install --no-cache-dir --index-url "$ROCM_INDEX" \
+# PyPI stays the main index. The ROCm wheels are only on AMD's index.
+RUN pip install --no-cache-dir --extra-index-url "$ROCM_INDEX" \
         "rocm[libraries,devel,device-gfx1151]==${ROCM}" \
     && ln -sfn "$(rocm-sdk path --root)" /opt/rocm
 ENV ROCM_PATH=/opt/rocm

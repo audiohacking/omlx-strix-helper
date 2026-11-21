@@ -6,9 +6,14 @@ on:
     types: [published]
   workflow_dispatch:
 
+# GITHUB_TOKEN is read-only unless the workflow says otherwise.
+# packages: write publishes to GHCR. The build action also pushes a
+# provenance attestation, which needs the other two.
 permissions:
   contents: read
   packages: write
+  attestations: write
+  id-token: write
 
 env:
   IMAGE: ghcr.io/audiohacking/omlx-strix-helper
@@ -33,9 +38,9 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "release" ]; then
             tag="${{ github.event.release.tag_name }}"
-            echo "list=${IMAGE}:${tag},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+            printf 'list<<EOF\n%s:%s\n%s:latest\nEOF\n' "$IMAGE" "$tag" "$IMAGE" >> "$GITHUB_OUTPUT"
           else
-            echo "list=${IMAGE}:sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+            printf 'list<<EOF\n%s:sha-%s\nEOF\n' "$IMAGE" "${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: docker/build-push-action@v6

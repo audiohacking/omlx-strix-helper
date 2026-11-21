@@ -9,7 +9,15 @@ oMLX 0.8.0 hands the front of a long prompt to a second GPU and keeps decode, th
 
 The package name is `omlx_cuda_helper`, so the oMLX protocol tests import it unchanged. In an oMLX tree it lives at `apps/omlx-strixworker`.
 
-M3 Ultra, one Strix Halo, Thunderbolt. Find devices, Pair, and Check. The cable has to be the bridge; the setup is in [DEMO.md](DEMO.md).
+Find devices, Pair, and Check. The setup is in [DEMO.md](DEMO.md).
+
+## The cable
+
+**10Gb, no patch.** A direct 10G cable, or both machines on a 10G switch. The port reports a media speed, so stock oMLX selects it. Use this when you have it. It can be faster than the bridge below. The results table was not measured on 10G.
+
+**Thunderbolt or USB, with the patch.** The Mac puts that port in a bridge. The bridge has a link-local address and no media speed, so stock oMLX stays on gigabit. The [audiohacking/omlx](https://github.com/audiohacking/omlx) fork ranks the bridge by the speed the Halo reports, 80 Gbit/s. If a 10G path is also up, leave the bridge down. While the bridge answers, the fork prefers it.
+
+After Pair, Check shows the cable in use. 10G reads **10000 Mbit/s**. The bridge reads **80000 Mbit/s**. **1000 Mbit/s** is the wrong cable.
 
 <img width="1130" height="644" alt="image" src="https://github.com/user-attachments/assets/85a1424a-5e0e-4ff4-94d1-4e2dde91eb0e" />
 
@@ -66,6 +74,17 @@ docker logs -f omlx-helper
 ```
 
 Host networking is what lets the Cluster tab find the helper. The volume holds the identity, the pairings, the model files oMLX copies over, and the kernel cache. Arguments after the image name go to `serve`, for example `--name halo`.
+
+Rootless podman does not see the `render` and `video` group names, so pass the caller's groups instead. The container also has to outlive the login that started it (`loginctl enable-linger`):
+
+```bash
+podman run -d --name omlx-helper --restart unless-stopped \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add keep-groups \
+  --network host --ipc host \
+  -v omlx-helper:/data \
+  ghcr.io/audiohacking/omlx-strix-helper
+```
 
 To update, run `docker pull ghcr.io/audiohacking/omlx-strix-helper`, then `docker rm -f omlx-helper` and the same `docker run`. The volume keeps the pairing and the model files. Other commands run in the container, for example `docker exec omlx-helper omlx-strixworker --state-dir /data status`. The first push is private until the package is made public in the repository settings.
 

@@ -17,6 +17,8 @@ command -v hipcc >/dev/null || { echo "error: hipcc not on PATH ($ROCM_PATH/bin)
 mkdir -p "$OUT_DIR"
 export CMAKE_PREFIX_PATH="$ROCM_PATH${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}"
+# The image installs ninja, not make. CMake's default generator is Make.
+export CMAKE_GENERATOR=Ninja
 # One token per argument: setup.py splits CMAKE_ARGS on spaces.
 export CMAKE_ARGS="-DMLX_BUILD_ROCM=ON -DMLX_ROCM_ARCHITECTURES=${ARCHS} \
 -DMLX_BUILD_CUDA=OFF -DMLX_BUILD_METAL=OFF -DMLX_BUILD_GGUF=OFF \
