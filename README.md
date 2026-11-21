@@ -1,5 +1,8 @@
 # omlx strix worker
 
+<img width="887" height="395" alt="omlxstrix" src="https://github.com/user-attachments/assets/5315dd92-b5ca-4dd1-a921-001e36028cbd" />
+
+
 A prefill accelerator for AMD Strix Halo that pairs into oMLX as the CUDA helper.
 
 oMLX 0.8.0 hands the front of a long prompt to a second GPU and keeps decode, the KV cache, and the API on the Mac. In the 0.8.0 release that GPU is a DGX Spark or two RTX A6000s. This worker puts a Strix Halo in the same seat: Radeon 8060S, gfx1151, the same discovery, pairing, control channel, and data frames. The Cluster tab learns nothing new.
@@ -8,7 +11,7 @@ The package name is `omlx_cuda_helper`, so the oMLX protocol tests import it unc
 
 M3 Ultra, one Strix Halo, Thunderbolt. Find devices, Pair, and Check:
 
-![oMLX prefill checks for strix-halo](docs/strix-halo-checks.png)
+<img width="1130" height="644" alt="image" src="https://github.com/user-attachments/assets/85a1424a-5e0e-4ff4-94d1-4e2dde91eb0e" />
 
 ## Results (WIP)
 
