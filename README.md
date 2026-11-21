@@ -21,6 +21,10 @@ After Pair, Check shows the cable in use. 10G reads **10000 Mbit/s**. The bridge
 
 <img width="1130" height="644" alt="image" src="https://github.com/user-attachments/assets/85a1424a-5e0e-4ff4-94d1-4e2dde91eb0e" />
 
+## Status
+* Super Alpha!
+* Only tested with `Qwen3.8-27B-oQ4e`
+
 ## Results (WIP)
 
 Qwen3.8 27B oQ4e. M3 Ultra 512 GB and one Strix Halo over Thunderbolt. 128 generated tokens, MTP on.
