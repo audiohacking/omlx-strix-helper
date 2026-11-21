@@ -35,7 +35,7 @@ Stock oMLX discovers the helper on the network both machines share and stays the
 
 After Pair, Check shows the cable actually in use. On 10G that is the 10G address at **10000 Mbit/s**. On the bridge it is the link-local address at **80000 Mbit/s**. A pass on a 1000 Mbit/s Ethernet address is the wrong cable. Unscoped 169.254 traffic follows whichever interface already owns that route; do not send the cable's traffic out the gigabit port.
 
-This helper reports version 0.1.6. The fork's check expects 0.1.7 and warns. The warning does not stop prefill. The family row is `qwen3_5`.
+This helper reports version 0.1.7, the helper release current oMLX expects. The family row is `qwen3_5`.
 
 ## Mac
 

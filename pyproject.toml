@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omlx-strixworker"
-version = "0.1.6"
+version = "0.1.7"
 description = "Prefill Accelerator helper for oMLX on AMD Strix Halo. Speaks the CUDA helper protocol."
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
