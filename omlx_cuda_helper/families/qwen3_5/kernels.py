@@ -251,6 +251,127 @@ def gated_delta(q, k, v, g, beta, state):
     return y, new_state
 
 
+# The elementwise steps between the matrix products, one launch each. As plain
+# MLX ops every step is its own kernel over tens of megabytes: the causal conv
+# alone took 10.6 ms of a 2048-row chunk in each linear layer, against 0.6 ms
+# here. Every kernel rounds where the ops it replaces round, and a layer takes
+# one only after its output equals the plain ops bit for bit.
+_GLUE_HEADER = """
+// Multiply and add stay separate, as the plain ops round them.
+#pragma clang fp contract(off)
+__device__ inline float glue_f(float x) { return x; }
+__device__ inline float glue_f(__half x) { return __half2float(x); }
+__device__ inline float glue_f(hip_bfloat16 x) { return static_cast<float>(x); }
+__device__ inline void glue_store(float x, float* o) { *o = x; }
+__device__ inline void glue_store(float x, __half* o) { *o = __float2half(x); }
+__device__ inline void glue_store(float x, hip_bfloat16* o) { *o = hip_bfloat16(x); }
+// x as the output type holds it.
+template <typename T> __device__ inline float glue_round(float x, T*) {
+  T rounded;
+  glue_store(x, &rounded);
+  return glue_f(rounded);
+}
+// The Sigmoid of this backend's unary ops.
+__device__ inline float glue_sigmoid(float x) {
+  const float y = 1.0f / (1.0f + expf(-fabsf(x)));
+  return (x < 0.0f) ? 1.0f - y : y;
+}
+"""
+
+# silu(causal_conv([window; x], w)). The taps add up in float32 in order and
+# the sum rounds once; the SiLU then rounds its sigmoid and its product.
+_CONV_SILU = """
+const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+const uint32_t t = blockIdx.y;
+const uint32_t channels = x_shape[2];
+if (c >= channels) return;
+float acc = 0.0f;
+for (uint32_t i = 0; i < TAPS; ++i) {
+  const uint32_t row = t + i;
+  const float value = (row < TAPS - 1)
+      ? glue_f(window[size_t(row) * channels + c])
+      : glue_f(x[size_t(row - (TAPS - 1)) * channels + c]);
+  const float product = value * w[c * TAPS + i];
+  acc = (i == 0) ? product : acc + product;
+}
+auto* out = y + (size_t(t) * channels + c);
+const float conv = glue_round(acc, out);
+const float sigmoid = glue_round(glue_sigmoid(conv), out);
+glue_store(conv * sigmoid, out);
+"""
+
+# silu(g) * u in the type of g.
+_SILU_MUL = """
+const uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
+if (e >= uint32_t(g_shape[1])) return;
+const float gate = glue_f(g[e]);
+const float sigmoid = glue_round(glue_sigmoid(gate), y + e);
+const float act = glue_round(gate * sigmoid, y + e);
+glue_store(act * glue_f(u[e]), y + e);
+"""
+
+# silu(z) * x in float32, rounded once to the type of x.
+_GATE_MUL = """
+const uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
+if (e >= uint32_t(x_shape[1])) return;
+const float gate = glue_f(z[e]);
+glue_store((gate * glue_sigmoid(gate)) * glue_f(x[e]), y + e);
+"""
+
+_GLUE_KERNELS: dict = {}
+
+
+def _glue(name: str, inputs: list[str], source: str, dtype: mx.Dtype):
+    # A kernel object compiles for the dtypes of its first call only.
+    kernel = _GLUE_KERNELS.get((name, dtype))
+    if kernel is None:
+        kernel = _GLUE_KERNELS[name, dtype] = mx.fast.cuda_kernel(
+            name=f"omlx_{name}_{str(dtype).rsplit('.', 1)[-1]}",
+            input_names=inputs,
+            output_names=["y"],
+            header=_GLUE_HEADER,
+            source=source,
+        )
+    return kernel
+
+
+def _launch(count: int) -> int:
+    return -(-count // _THREADS) * _THREADS
+
+
+def conv_silu(window: mx.array, x: mx.array, taps: mx.array) -> mx.array:
+    """``silu(causal_conv([window; x], taps))`` for x [1, rows, C]."""
+    rows, channels = x.shape[1], x.shape[2]
+    return _glue("conv_silu", ["window", "x", "w"], _CONV_SILU, x.dtype)(
+        inputs=[window.astype(x.dtype), x, taps],
+        template=[("TAPS", taps.shape[1])],
+        grid=(_launch(channels), rows, 1),
+        threadgroup=(_THREADS, 1, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
+def _elementwise(name: str, inputs: list[str], source: str, a: mx.array, b: mx.array):
+    return _glue(name, inputs, source, a.dtype)(
+        inputs=[a.reshape(1, -1), b.astype(a.dtype).reshape(1, -1)],
+        grid=(_launch(a.size), 1, 1),
+        threadgroup=(_THREADS, 1, 1),
+        output_shapes=[(1, a.size)],
+        output_dtypes=[a.dtype],
+    )[0].reshape(a.shape)
+
+
+def silu_mul(gate: mx.array, up: mx.array) -> mx.array:
+    """``nn.silu(gate) * up`` for two arrays of one shape and type."""
+    return _elementwise("silu_mul", ["g", "u"], _SILU_MUL, gate, up)
+
+
+def gate_mul(x: mx.array, z: mx.array) -> mx.array:
+    """``silu(z) * x`` in float32, rounded once to the type of x."""
+    return _elementwise("gate_mul", ["x", "z"], _GATE_MUL, x, z)
+
+
 # Gufo's gfx1151 WMMA attention for the Qwen 24/4/256 shape. MLX's own flash
 # kernel is about 2 TFLOP/s here; this one holds ~30. The source and the
 # shared library are built on the Strix. See gufo_attention.hip.

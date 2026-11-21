@@ -79,6 +79,9 @@ class GatedDeltaNet:
         self.norm_weight = w["norm.weight"]
         self.conv = causal_conv
         self._gdn = None
+        # HIP kernels for the steps around the recurrence.
+        self._conv_silu = None
+        self._gate_mul = None
 
     def enable_kernels(self) -> None:
         """Use the conv kernel if it equals ``causal_conv`` on these taps."""
@@ -91,15 +94,53 @@ class GatedDeltaNet:
         else:
             kernels.logger.warning("Causal conv kernel differs; using the reference")
 
-    def enable_rocm(self) -> None:
+    def enable_rocm(self, gdn: Any = None) -> None:
+        """Use the HIP kernels that match the plain ops.
+
+        ``gdn``: the recurrence kernel a layer of the same head shape already
+        checked.
+        """
+        if not kernels.hip_jit():
+            return
+        self._enable_glue()
+        if gdn is not None:
+            self._gdn = gdn
+        else:
+            self._enable_recurrence()
+
+    def _enable_glue(self) -> None:
+        """Take the conv and gate kernels if they equal the plain ops."""
+        dtype = self.qkv.weight.dtype
+        width = self.taps.shape[1] - 1
+        # Three chunks: a zero window, a carried one, and one shorter than it.
+        window = None
+        try:
+            for rows in (64, 37, width - 1):
+                x = (3.0 * mx.random.normal((1, rows, self.taps.shape[0]))).astype(dtype)
+                shown = window
+                if shown is None:
+                    shown = mx.zeros((1, width, x.shape[-1]), dtype=dtype)
+                conv_in = mx.concatenate([shown, x], axis=1)
+                want = nn.silu(causal_conv(conv_in, self.taps))
+                if not mx.array_equal(kernels.conv_silu(shown, x, self.taps), want).item():
+                    raise ValueError("the conv kernel differs")
+                window = conv_in[:, rows:]
+            y = (3.0 * mx.random.normal((1, 64, self.value_heads, self.value_dim))).astype(dtype)
+            z = (4.0 * mx.random.normal(y.shape)).astype(dtype)
+            want = (nn.silu(z.astype(mx.float32)) * y.astype(mx.float32)).astype(dtype)
+            if not mx.array_equal(kernels.gate_mul(y, z), want).item():
+                raise ValueError("the gate kernel differs")
+        except Exception as e:
+            kernels.logger.warning("Linear layer kernels off, using plain ops: %s", e)
+            return
+        self._conv_silu, self._gate_mul = kernels.conv_silu, kernels.gate_mul
+
+    def _enable_recurrence(self) -> None:
         """Use the HIP gated-delta kernel when it matches the mlx recurrence.
 
         The check is a short sequence. The op it is checked against expands
         into one graph per token, which is the path this kernel replaces.
         """
-
-        if not kernels.hip_jit():
-            return
         dtype = self.qkv.weight.dtype
         b, t = 1, 16
         hk, hv = self.key_heads, self.value_heads
@@ -127,6 +168,9 @@ class GatedDeltaNet:
         else:
             kernels.logger.warning("Gated-delta kernel differs; using the reference")
 
+    def linears(self) -> list[Linear]:
+        return [self.qkv, self.z, self.b, self.a, self.out]
+
     def parameters(self) -> list[mx.array]:
         linears = (self.qkv, self.z, self.b, self.a, self.out)
         own = [self.taps, self.decay, self.dt_bias, self.norm_weight]
@@ -138,8 +182,17 @@ class GatedDeltaNet:
         if window is None:
             width = self.taps.shape[1] - 1
             window = mx.zeros((1, width, qkv.shape[-1]), dtype=qkv.dtype)
-        conv_in = mx.concatenate([window, qkv], axis=1)
-        conv_out = nn.silu(self.conv(conv_in, self.taps))
+        width = window.shape[1]
+        if self._conv_silu is None:
+            conv_in = mx.concatenate([window, qkv], axis=1)
+            conv_out = nn.silu(self.conv(conv_in, self.taps))
+            window = conv_in[:, rows:]
+        else:
+            conv_out = self._conv_silu(window, qkv, self.taps)
+            if rows >= width:
+                window = qkv[:, rows - width :]
+            else:
+                window = mx.concatenate([window, qkv], axis=1)[:, rows:]
         keys = self.key_heads * self.key_dim
         q = conv_out[..., :keys].reshape(1, rows, self.key_heads, self.key_dim)
         k = conv_out[..., keys : 2 * keys].reshape(q.shape)
@@ -151,7 +204,7 @@ class GatedDeltaNet:
         eps = 1e-6 * scale**2
         q = (scale**2) * mx.fast.rms_norm(q, None, eps)
         k = scale * mx.fast.rms_norm(k, None, eps)
-        return q, k, v, mx.contiguous(conv_in[:, rows:])
+        return q, k, v, mx.contiguous(window)
 
     def gates(self, a: mx.array, b: mx.array) -> tuple[mx.array, mx.array]:
         """(decay in float32, update rate) of each step and value head."""
@@ -167,6 +220,8 @@ class GatedDeltaNet:
         if self.out.rotation is not None:
             rows = (1, y.shape[1], -1)
             return oqh.gate_rotate(y.reshape(rows), z.reshape(rows), *self.out.rotation)
+        if self._gate_mul is not None:
+            return self._gate_mul(y, z.reshape(y.shape)).reshape(1, y.shape[1], -1)
         gate = nn.silu(z.reshape(y.shape).astype(mx.float32))
         gated = (gate * y.astype(mx.float32)).astype(y.dtype)
         return gated.reshape(1, y.shape[1], -1)
@@ -259,6 +314,9 @@ class Attention:
         self.k_norm = w["k_norm.weight"]
         self.fused = False
         self._gufo = False
+
+    def linears(self) -> list[Linear]:
+        return [self.q_proj, self.k_proj, self.v_proj, self.o_proj]
 
     def parameters(self) -> list[mx.array]:
         linears = (self.q_proj, self.k_proj, self.v_proj, self.o_proj)
@@ -372,6 +430,10 @@ class Layer:
         self.up = w.linear("mlp.up_proj")
         self.down = w.linear("mlp.down_proj")
         oqh.check_shared(self.gate, self.up)
+        self._silu_mul = None
+
+    def linears(self) -> list[Linear]:
+        return [self.gate, self.up, self.down, *self.mixer.linears()]
 
     def parameters(self) -> list[mx.array]:
         linears = (self.gate, self.up, self.down)
@@ -382,14 +444,32 @@ class Layer:
         """Switch the mixer to the CUDA kernels that pass their self-check."""
         self.mixer.enable_kernels()
 
-    def enable_rocm(self) -> None:
-        self.mixer.enable_rocm()
+    def enable_rocm(self, gdn: Any = None) -> None:
+        """Switch to the HIP kernels that pass their self-check."""
+        if self.linear:
+            self.mixer.enable_rocm(gdn)
+        else:
+            self.mixer.enable_rocm()
+        if not kernels.hip_jit():
+            return
+        dtype = self.gate.weight.dtype
+        gate = (4.0 * mx.random.normal((1, 64, 1024))).astype(dtype)
+        up = (4.0 * mx.random.normal(gate.shape)).astype(dtype)
+        try:
+            if mx.array_equal(kernels.silu_mul(gate, up), nn.silu(gate) * up).item():
+                self._silu_mul = kernels.silu_mul
+                return
+            kernels.logger.warning("MLP activation kernel differs; using plain ops")
+        except Exception:
+            kernels.logger.warning("MLP activation kernel failed", exc_info=True)
 
     def new_cache(self) -> Any:
         return [None, None] if self.linear else KVCache()
 
     def mlp(self, x: mx.array, rot: mx.array | None = None) -> mx.array:
         if self.down.rotation is None:
+            if self._silu_mul is not None:
+                return self.down(self._silu_mul(self.gate(x), self.up(x)))
             return self.down(nn.silu(self.gate(x)) * self.up(x))
         # oQh: the activation is taken in float32 and rotated for down.
         rot = self.gate.rotated(x) if rot is None else rot

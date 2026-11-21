@@ -49,11 +49,15 @@ class Stage:
             )
         ]
         linear = linear_layers(text)
+        self.rocm = not kernels.available() and kernels.hip_jit()
 
         def load_layer(i: int) -> Layer:
             wanted = [n for n in names if n.startswith(f"{root}layers.{i}.")]
             weights = Weights(load(model_dir, wanted), config, root)
             layer = Layer(weights.at(f"layers.{i}"), text, linear[i])
+            if self.rocm:
+                for dense in layer.linears():
+                    dense.lay_columns()
             mx.eval(layer.parameters())
             # The packed tensors of the unpacked linears are no longer needed.
             del weights
@@ -102,8 +106,15 @@ class Stage:
         layer = self._load_layer(self.last)
         if kernels.available():
             layer.enable_kernels()
+        elif self.rocm:
+            layer.enable_rocm(self._recurrence())
         self.layers.append(layer)
         self.last += 1
+
+    def _recurrence(self):
+        """The gated-delta kernel a linear layer of this stage checked."""
+        held = (layer.mixer._gdn for layer in self.layers if layer.linear)
+        return next((gdn for gdn in held if gdn is not None), None)
 
     def new_job(self, layers: int) -> list:
         return [layer.new_cache() for layer in self.layers[:layers]]
@@ -160,15 +171,12 @@ class Stage:
         if kernels.available():
             for layer in self.layers:
                 layer.enable_kernels()
-        elif kernels.hip_jit():
+        elif self.rocm:
             # Every linear layer has the same head shape, so the slow
             # reference comparison runs once and the rest reuse the kernel.
             gdn = None
             for layer in self.layers:
-                if layer.linear and gdn is not None:
-                    layer.mixer._gdn = gdn
-                    continue
-                layer.enable_rocm()
+                layer.enable_rocm(gdn)
                 if layer.linear:
                     gdn = layer.mixer._gdn
 
