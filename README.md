@@ -1,32 +1,54 @@
-# omlx-strixworker
+# omlx strix worker
 
-Prefill helper for an AMD Strix Halo machine. oMLX drives it as the CUDA helper: same discovery, pairing, control channel, and data framing. This repo is the only place that code is committed. The oMLX checkout holds it as `apps/omlx-strixworker` while it is being tested.
+A prefill accelerator for AMD Strix Halo that pairs into oMLX as the CUDA helper.
 
-The import package is `omlx_cuda_helper` on purpose. The protocol tests in the oMLX tree import that name, and this process has to answer them.
+oMLX 0.8.0 hands the front of a long prompt to a second GPU and keeps decode, the KV cache, and the API on the Mac. In the 0.8.0 release that GPU is a DGX Spark or two RTX A6000s. This worker puts a Strix Halo in the same seat: Radeon 8060S, gfx1151, the same discovery, pairing, control channel, and data frames. The Cluster tab learns nothing new.
 
-## Paired with oMLX
+The package name is `omlx_cuda_helper`, so the oMLX protocol tests import it unchanged. In an oMLX tree it lives at `apps/omlx-strixworker`.
 
-oMLX 0.8.0 discovers this process the same way it discovers the CUDA helper. On a Strix Halo named `strix-halo`, Find devices, Pair, and Check all pass:
+M3 Ultra, one Strix Halo, Thunderbolt. Find devices, Pair, and Check:
 
 ![oMLX prefill checks for strix-halo](docs/strix-halo-checks.png)
 
-## Protocol tests
+## Results (WIP)
 
-From the oMLX checkout, so this package is imported instead of `apps/omlx-cuda-helper`:
+Qwen3.8 27B oQ4e. M3 Ultra 512 GB and one Strix Halo over Thunderbolt. 128 generated tokens, MTP on.
 
-```bash
-.venv/bin/pytest apps/omlx-cuda-helper/tests/test_protocol.py \
-  apps/omlx-cuda-helper/tests/test_chain.py \
-  -o 'pythonpath=apps/omlx-strixworker apps/omlx-cuda-helper/tests' -q
-```
+| Prompt | Prefill tok/s | Decode tok/s |
+| --- | ---: | ---: |
+| 1,024 | 312 | 79 |
+| 8,192 | 780 | 81 |
+| 32,768 | 811 | 165 |
+| 65,536 | 710 | 67 |
 
-`test_qwen3_5.py` replays the oMLX contract fixture through this package's stage. On a Mac that is the Metal path, the same one the CUDA helper uses when CUDA is absent. On the Halo it is the ROCm path. The CUDA-only oQh checks stay skipped until that kernel is ported.
+Same model, 64K prompt, M3 Ultra 512 GB. The Spark and A6000 rows are the oMLX 0.8.0 release, a CUDA helper over 2.5 GbE. Decode stays on the Mac in every row.
 
-The Halo build is MLX `fc344c9` with the mlxcel ROCm overlay, ROCm `10.3.0a20261120`, and `patches/nvfp4-gfx1151-hipcc.patch`. hipcc 7.18 aborts while compiling `nvfp4_gather_expert_batched_kernel` for gfx1151, so that launch falls through to `nvfp4_qmv`. Qwen3.5 affine does not use it. With that patch the same contract test passed on the Radeon 8060S: 10 passed, 5 skipped.
+| 64K prefill | tok/s |
+| --- | ---: |
+| M3 Ultra alone | 352 |
+| DGX Spark | 1,062 |
+| 2× RTX A6000 | 1,879 |
+| Strix Halo | 710 |
 
-`patches/rocm-cuda-kernel-hip.patch` makes `mx.fast.cuda_kernel` call the HIP JIT. The Qwen3.5 stage uses that to run gated delta as one GPU launch per layer. Without it the ROCm primitive expands the recurrence into one graph per token and the Radeon sits idle.
+At 32,768 tokens the draft copies 94 of 98 eligible prompt tokens, and decode reads 165 tok/s. At 65,536 the Mac drafts new tokens at 67 tok/s.
 
-Long-context attention is `gufo_attention.hip`, adapted from Gufo's WMMA kernel (MIT) for the Qwen 24/4/256 shape. Build it on the Halo; the shared library stays on that machine:
+## The split
+
+The Mac holds the weights, the cache, and generation. From 2,048 tokens up, the Halo takes layers `[0, K)` and returns the hidden state plus the cache rows for that prefix. The Mac runs the layers that remain. Auto sets K from the measured pace of each side. Shorter prompts, and any prompt with an image, stay on the Mac.
+
+## On the Radeon
+
+Two kernels carry that prefix.
+
+**Gated delta** is one HIP launch per layer. `patches/rocm-cuda-kernel-hip.patch` forwards `mx.fast.cuda_kernel` to the HIP JIT, and the recurrence runs on the GPU. The stock ROCm op builds a graph per token and leaves the shader arrays idle.
+
+**Attention** is Gufo's WMMA kernel, adapted for Qwen's 24 query heads, 4 KV heads, and head dimension 256 (MIT, `gufo_attention.hip`). On gfx1151 it holds about 30 TF. The stock flash kernel holds about 2. A partial query tile is legal, so the short tail of a 64K prompt stays on this kernel.
+
+The supported family is `qwen3_5`.
+
+## Build
+
+The attention library is a gfx1151 binary and stays out of git. Build it on the Halo:
 
 ```bash
 hipcc -O3 -shared -fPIC --offload-arch=gfx1151 -std=c++20 \
@@ -34,9 +56,17 @@ hipcc -O3 -shared -fPIC --offload-arch=gfx1151 -std=c++20 \
   -o omlx_cuda_helper/families/qwen3_5/libgufo_attn.so
 ```
 
+The measured build is MLX `fc344c9` with the mlxcel ROCm overlay and ROCm `10.3.0a20261120`. hipcc 7.18 stops on `nvfp4_gather_expert_batched_kernel` for gfx1151. `patches/nvfp4-gfx1151-hipcc.patch` sends that launch to `nvfp4_qmv`. Qwen3.5 affine never takes it.
+
+## Protocol tests
+
+From an oMLX checkout:
+
 ```bash
 .venv/bin/pytest apps/omlx-cuda-helper/tests/test_qwen3_5.py \
   apps/omlx-cuda-helper/tests/test_protocol.py \
   apps/omlx-cuda-helper/tests/test_chain.py \
   -o 'pythonpath=apps/omlx-strixworker apps/omlx-cuda-helper/tests' -q
 ```
+
+`test_qwen3_5.py` replays the oMLX contract fixture through this stage. Metal on a Mac, ROCm on the Halo. The oQh cases skip.
