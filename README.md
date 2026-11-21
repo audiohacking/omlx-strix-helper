@@ -27,25 +27,25 @@ After Pair, Check shows the cable in use. 10G reads **10000 Mbit/s**. The bridge
 
 ## Results (WIP)
 
-Qwen3.8 27B oQ4e. M3 Ultra 512 GB and one Strix Halo over Thunderbolt. 128 generated tokens, MTP on.
+Qwen3.8 27B oQ4e. M3 Ultra 512 GB and one Strix Halo over Thunderbolt. 64 generated tokens, MTP on.
 
 | Prompt | Prefill tok/s | Decode tok/s |
 | --- | ---: | ---: |
-| 1,024 | 312 | 79 |
-| 8,192 | 780 | 81 |
-| 32,768 | 811 | 165 |
-| 65,536 | 710 | 67 |
+| 1,024 | 312 | 71 |
+| 8,192 | 862 | 67 |
+| 32,768 | 938 | 163 |
+| 65,536 | 831 | 66 |
 
 Same model, 64K prompt, M3 Ultra 512 GB. The Spark and A6000 rows are the oMLX 0.8.0 release, a CUDA helper over 2.5 GbE. Decode stays on the Mac in every row.
 
 | 64K prefill | tok/s |
 | --- | ---: |
 | M3 Ultra alone | 352 |
-| + Strix Halo | 710 |
+| + Strix Halo | 831 |
 | + DGX Spark | 1,062 |
 | + 2× RTX A6000 | 1,879 |
 
-At 32,768 tokens the draft copies 94 of 98 eligible prompt tokens, and decode reads 165 tok/s. At 65,536 the Mac drafts new tokens at 67 tok/s.
+At 32,768 tokens the draft copies 49 of 49 eligible prompt tokens, and decode reads 163 tok/s. At 65,536 the Mac drafts new tokens at 66 tok/s.
 
 ## The split
 
@@ -53,11 +53,15 @@ The Mac holds the weights, the cache, and generation. From 2,048 tokens up, the 
 
 ## On the Radeon
 
-Two kernels carry that prefix.
+Three things carry that prefix.
 
-**Gated delta** is one HIP launch per layer. `patches/rocm-cuda-kernel-hip.patch` forwards `mx.fast.cuda_kernel` to the HIP JIT, and the recurrence runs on the GPU. The stock ROCm op builds a graph per token and leaves the shader arrays idle.
+**Gated delta** is one HIP launch per layer. `patches/rocm-cuda-kernel-hip.patch` forwards `mx.fast.cuda_kernel` to the HIP JIT, and the recurrence runs on the GPU. One lane owns one value row and keeps its state in registers, so a step waits on no memory. The stock ROCm op builds a graph per token and leaves the shader arrays idle.
 
-**Attention** is Gufo's WMMA kernel, adapted for Qwen's 24 query heads, 4 KV heads, and head dimension 256 (MIT, `gufo_attention.hip`). On gfx1151 it holds about 30 TF. The stock flash kernel holds about 2. A partial query tile is legal, so the short tail of a 64K prompt stays on this kernel.
+**Attention** is Gufo's WMMA kernel, adapted for Qwen's 24 query heads, 4 KV heads, and head dimension 256 (MIT, `gufo_attention.hip`). On gfx1151 it holds about 30 TF. The stock flash kernel holds about 2. Each layer keeps its keys and values packed for the kernel, so a chunk adds its own rows and nothing re-copies the prompt. The call waits with its thread awake: with every core asleep the same kernel runs a quarter slower. A partial query tile is legal, so the short tail of a 64K prompt stays on this kernel.
+
+**The steps between** the matrix products are one kernel each: the causal conv with its norms, the output gate, the MLP activation. As separate MLX ops they took a quarter of a chunk. Dense weights are stored as `[in, out]`, the operand hipBLASLt multiplies fastest.
+
+Each kernel is checked against the plain ops when a model loads. A layer that fails a check keeps the plain ops.
 
 The supported family is `qwen3_5`.
 

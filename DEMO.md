@@ -2,7 +2,7 @@
 
 One M3 Ultra and one Strix Halo. The Mac runs oMLX, holds the weights, the KV cache, and decode. From 2,048 tokens up, the Halo prefills layers `[0, K)` and returns the hidden state plus the cache rows. The Mac runs the layers that remain. Prompts shorter than that, and any prompt with an image, stay on the Mac.
 
-The numbers in the README are this setup. Qwen3.8 27B oQ4e, 65,536-token prompt, 128 generated tokens, MTP on: **710 prefill tok/s, 67 decode tok/s**. The same prompt on the gigabit port is not this demo.
+The numbers in the README are this setup. Qwen3.8 27B oQ4e, 65,536-token prompt, 64 generated tokens, MTP on: **831 prefill tok/s, 66 decode tok/s**. The same prompt on the gigabit port is not this demo.
 
 ## Machines
 
@@ -35,7 +35,7 @@ Stock oMLX discovers the helper on the network both machines share and stays the
 
 After Pair, Check shows the cable actually in use. On 10G that is the 10G address at **10000 Mbit/s**. On the bridge it is the link-local address at **80000 Mbit/s**. A pass on a 1000 Mbit/s Ethernet address is the wrong cable. Unscoped 169.254 traffic follows whichever interface already owns that route; do not send the cable's traffic out the gigabit port.
 
-This helper reports version 0.1.7, the helper release current oMLX expects. The family row is `qwen3_5`.
+This helper reports version 0.1.8. Current oMLX expects 0.1.7 or newer. The family row is `qwen3_5`.
 
 ## Mac
 
@@ -91,7 +91,7 @@ hipcc -O3 -shared -fPIC --offload-arch=gfx1151 -std=c++20 \
   -o omlx_cuda_helper/families/qwen3_5/libgufo_attn.so
 ```
 
-Dense linears stay `x @ weight.T` through hipBLASLt. Attention is Gufo's packed WMMA kernel (`WmmaCausalAttention<32,16,true>`) once a chunk has at least 1,024 query rows.
+Dense linears go through hipBLASLt, with each weight stored as `[in, out]`. Attention is Gufo's packed WMMA kernel (`WmmaCausalAttention<32,16,true>`) over a packed cache each layer keeps for the prompt.
 
 Install and serve from this repo, with `rocm-sdk` on `PATH` and `ROCM_PATH` set to that SDK:
 
@@ -106,8 +106,8 @@ omlx-strixworker serve --name halo
 
 State lives in `~/.omlx-cuda-helper`. Pass `--pair` only for a helper that is not paired yet. A paired helper is joined from the Mac: Cluster, Find devices, Pair, Check.
 
-## What the 710 run is
+## What the 831 run is
 
-Balanced firmware, the bridge at 80 Gbit/s, native bf16, ANE and MTP on, hipBLASLt for the linears, one packed attention launch per full-attention layer. Auto picks how the 64 layers split. The link is tens of milliseconds. The Mac's remaining layers are the long pole when the bridge is the cable.
+Balanced firmware, the bridge at 80 Gbit/s, native bf16, ANE and MTP on, hipBLASLt for the linears, one packed attention launch per full-attention layer. Auto picks how the 64 layers split, and on this desk it settles at 37 on the Halo. The link is tens of milliseconds. Early in the prompt the Halo is the slower side by a little. Late in the prompt the Mac's remaining layers are the long pole.
 
-A repeat of the 64K prompt on that bridge lands on the README row. A 10G cable or a 10G switch is the preferred substitute, and it can come out ahead of the bridge; there is no 10G row in the table yet. Treat a result near 300 tok/s as the gigabit port, or as the helper having been dropped, and check the cable before changing a kernel.
+A repeat of the 64K prompt on that bridge lands within about 1% of the README row. The first prompt after a helper update can come in lower: Auto is still on the split it learned from the old helper. A 10G cable or a 10G switch is the preferred substitute, and it can come out ahead of the bridge; there is no 10G row in the table yet. Treat a result near 300 tok/s as the gigabit port, or as the helper having been dropped, and check the cable before changing a kernel.
