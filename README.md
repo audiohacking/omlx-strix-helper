@@ -63,7 +63,22 @@ Three things carry that prefix.
 
 Each kernel is checked against the plain ops when a model loads. A layer that fails a check keeps the plain ops.
 
-The supported family is `qwen3_5`.
+## Models
+
+The six families of the CUDA helper, at the same contract version.
+
+| Family | `model_type` | On the Radeon |
+| --- | --- | --- |
+| Qwen3.8 27B | `qwen3_5` | Measured. HIP kernels. |
+| Qwen3.8 Flash-Next | `qwen4_exp` | Fixture. HIP recurrence, plain ops for the rest. |
+| MiniMax M3 / M3.1 | `minimax_m3_vl` | Fixture. Plain ops. |
+| GLM-5.3 Flash | `glm5_next` | Fixture. Plain ops. |
+| DeepSeek V4.1 | `deepseek_v41` | Fixture. Plain ops. |
+| Inkling 2 Small | `inkling2` | Fixture. Plain ops. |
+
+Fixture: the stage replays oMLX's contract fixture for that family on gfx1151 and matches the Mac's recorded output. No full checkpoint of those five has run here yet.
+
+The CUDA helper's kernels for those families are tensor-core code and stay off. oQh checkpoints stay on the Mac. This MLX build has no 3-bit expert product, so a checkpoint with 3-bit experts does not run on the Halo yet.
 
 ## Run with Docker
 
@@ -115,10 +130,8 @@ The measured build is MLX `fc344c9` with the mlxcel ROCm overlay and ROCm `10.3.
 From an oMLX checkout:
 
 ```bash
-.venv/bin/pytest apps/omlx-cuda-helper/tests/test_qwen3_5.py \
-  apps/omlx-cuda-helper/tests/test_protocol.py \
-  apps/omlx-cuda-helper/tests/test_chain.py \
+.venv/bin/pytest apps/omlx-cuda-helper/tests \
   -o 'pythonpath=apps/omlx-strixworker apps/omlx-cuda-helper/tests' -q
 ```
 
-`test_qwen3_5.py` replays the oMLX contract fixture through this stage. Metal on a Mac, ROCm on the Halo. The oQh cases skip.
+Each family's test replays its oMLX contract fixture through this worker's stage. Metal on a Mac, ROCm on the Halo. The CUDA kernel and oQh cases skip.
