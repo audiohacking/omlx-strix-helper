@@ -5,7 +5,7 @@ The package name and the wire protocol match the CUDA helper, so the oMLX
 already running on the Mac drives this process without a Strix-specific path.
 """
 
-__version__ = "0.1.9"
+__version__ = "0.1.10"
 
 # Framing and ops of the prefill data channel (oMLX ``wire.PROTOCOL``).
 DATA_PROTOCOL = 1

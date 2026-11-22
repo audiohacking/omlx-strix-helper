@@ -31,7 +31,7 @@ Over Thunderbolt, the Halo's interface negotiates 80 Gbit/s and has no DHCP leas
 
 After Pair, Check shows the cable in use: **10000 Mbit/s** on 10G, **80000 Mbit/s** on the bridge. **1000 Mbit/s** means the traffic is on the gigabit port.
 
-The helper reports version 0.1.9; oMLX expects 0.1.7 or newer.
+The helper reports version 0.1.10; oMLX expects 0.1.7 or newer.
 
 ## Mac
 
