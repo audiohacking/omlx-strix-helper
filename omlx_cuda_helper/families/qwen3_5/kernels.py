@@ -204,8 +204,8 @@ for (int i = 0; i < n_per_t; ++i) {
 # The same recurrence with the roles turned: one lane owns one value row and
 # its whole state row in registers, and the key and query of a step reach
 # every lane as scalars. A step then has no shuffles and no memory in its
-# path: the rows of the next step load behind the current one. q and k are
-# float32 here. The sums keep the order of the kernel above, 32 sums of every
+# path: the rows of the next step load behind the current one. q and k widen
+# to float32 as they load, exactly. The sums keep the order of the kernel above, 32 sums of every
 # 32nd key and a pairwise tree, so both give the same bits; this one takes
 # 3.0 ms where that takes 6.8 ms for 2048 steps of 48 heads on a Radeon 8060S.
 _GDN_ROWS_SOURCE = """
@@ -230,8 +230,8 @@ float state[Dk];
 #pragma unroll
   for (int i = 0; i < Dk; ++i) state[i] = in[i];
 }
-const float* q_ = q + (size_t(b_idx) * T * Hk + hk_idx) * Dk + lane * PER;
-const float* k_ = k + (size_t(b_idx) * T * Hk + hk_idx) * Dk + lane * PER;
+auto q_ = q + (size_t(b_idx) * T * Hk + hk_idx) * Dk + lane * PER;
+auto k_ = k + (size_t(b_idx) * T * Hk + hk_idx) * Dk + lane * PER;
 auto v_ = v + (size_t(b_idx) * T * Hv + hv_idx) * Dv + dv_idx;
 auto g_ = g + size_t(b_idx) * T * Hv + hv_idx;
 auto beta_ = beta + size_t(b_idx) * T * Hv + hv_idx;
@@ -240,8 +240,8 @@ auto y_ = y + (size_t(b_idx) * T * Hv + hv_idx) * Dv + dv_idx;
 int kn[PER], qn[PER], kc[PER], qc[PER];
 #pragma unroll
 for (int j = 0; j < PER; ++j) {
-  kn[j] = __builtin_bit_cast(int, k_[j]);
-  qn[j] = __builtin_bit_cast(int, q_[j]);
+  kn[j] = __builtin_bit_cast(int, gdn_f(k_[j]));
+  qn[j] = __builtin_bit_cast(int, gdn_f(q_[j]));
 }
 float vn = gdn_f(v_[0]), gn = gdn_f(g_[0]), bn = gdn_f(beta_[0]);
 
@@ -261,8 +261,8 @@ for (int t = 0; t < T; ++t) {
     beta_ += Hv;
 #pragma unroll
     for (int j = 0; j < PER; ++j) {
-      kn[j] = __builtin_bit_cast(int, k_[j]);
-      qn[j] = __builtin_bit_cast(int, q_[j]);
+      kn[j] = __builtin_bit_cast(int, gdn_f(k_[j]));
+      qn[j] = __builtin_bit_cast(int, gdn_f(q_[j]));
     }
     vn = gdn_f(v_[0]); gn = gdn_f(g_[0]); bn = gdn_f(beta_[0]);
   }
@@ -323,8 +323,6 @@ def _gdn_launch(rows: bool, q, k, v, g, beta, state):
     b, t, hk, dk = q.shape
     hv, dv = v.shape[2], v.shape[3]
     dtype = q.dtype
-    if rows:
-        q, k = q.astype(mx.float32), k.astype(mx.float32)
     # The grid is in threads. A group of the first kernel is (32, 4, 1): Dv
     # threads cover the value axis and one group per head covers the batch.
     # A group of the second is one wave of 32 value rows.

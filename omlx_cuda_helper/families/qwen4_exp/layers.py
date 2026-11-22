@@ -467,6 +467,8 @@ class MoE:
         self.gate_up = self._bank(banks, ("gate_proj", "up_proj"))
         self.down = self._bank(banks, ("down_proj",))
         self.combine = None
+        # The combine kernel that also adds the gated shared expert.
+        self.combine_shared = None
         self.gather = None
         self.swiglu = None
         self.expert_kernel = False
@@ -588,6 +590,8 @@ class MoE:
             got = hip.combine_experts(y, positions, scores)
             if kernels.close(got, want, "MoE sum"):
                 self.combine = hip.combine_experts
+        if self.combine is hip.combine_experts and self.combine_shared is None:
+            self._take_combine_shared(width, dtype)
         if (
             self.hip_banks is not None
             or self.oqh
@@ -613,6 +617,22 @@ class MoE:
             self.expert_kernel = True
         else:
             self.hip_banks = None
+
+    def _take_combine_shared(self, width: int, dtype: mx.Dtype) -> None:
+        """Use the fused combine if it gives the bits of the combine, the
+        gated shared expert and their sum as separate ops."""
+        k, tokens = self.top_k, 64
+        y = mx.random.normal((tokens * k, 1, width)).astype(dtype)
+        positions = mx.argsort(mx.random.uniform(shape=(tokens * k,)))
+        scores = mx.random.uniform(shape=(tokens, k)).astype(dtype)
+        shared = mx.random.normal((tokens, width)).astype(dtype)
+        gate = mx.sigmoid(mx.random.normal((tokens, 1))).astype(dtype)
+        want = hip.combine_experts(y, positions, scores) + gate * shared
+        got = hip.combine_shared(y, positions, scores, shared, gate[:, 0])
+        if mx.array_equal(got, want).item():
+            self.combine_shared = hip.combine_shared
+        else:
+            kernels.logger.warning("Fused MoE combine differs; using the separate ops")
 
     def _experts_match(self, dtype: mx.Dtype) -> bool:
         """Whether the expert kernel path gives the bits of gather_qmm.
@@ -737,7 +757,7 @@ class MoE:
     def combined(self, y: mx.array, positions: mx.array, scores: mx.array) -> mx.array:
         """Each token's expert outputs times their weights, summed."""
         if self.combine is not None:
-            return self.combine(y, positions, scores[0])[None]
+            return self.combine(y, positions, mx.squeeze(scores, 0))[None]
         rows, k = scores.shape[1:]
         return stacked_sum(y[positions].reshape(1, rows, k, -1) * scores[..., None])
 
@@ -747,7 +767,16 @@ class MoE:
 
     def __call__(self, x: mx.array) -> mx.array:
         chosen, scores = self.route(self.router(x))
-        return self.combined(*self.experts(x, chosen), scores) + self.shared(x)
+        y, positions = self.experts(x, chosen)
+        if self.combine_shared is not None:
+            shared = self.shared_down(nn.silu(self.shared_gate(x)) * self.shared_up(x))
+            gate = mx.sigmoid(self.shared_scale(x))
+            out = self.combine_shared(
+                y, positions, mx.squeeze(scores, 0), mx.squeeze(shared, 0),
+                mx.squeeze(gate, (0, 2)),
+            )
+            return out[None]
+        return self.combined(y, positions, scores) + self.shared(x)
 
 
 class Layer:

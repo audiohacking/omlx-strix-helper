@@ -1403,6 +1403,21 @@ fn_store8(out + token * width + d, part[0]);
 """
 
 
+# The same sum, then the gated shared expert added in, as MoE adds it:
+# round(sum + round(gate * shared)). sh [tokens, width] and gs [tokens] bf16.
+_COMBINE_SHARED = _COMBINE.replace(
+    "fn_store8(out + token * width + d, part[0]);",
+    """{
+  const float gate = fn_float(reinterpret_cast<const unsigned short*>(gs)[token]);
+  float shared[8];
+  fn_load8(sh + token * width + d, shared);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) part[0][e] = fn_round(part[0][e] + fn_round(gate * shared[e]));
+}
+fn_store8(out + token * width + d, part[0]);""",
+)
+
+
 def combine_fits(width: int, top_k: int, dtype: mx.Dtype) -> bool:
     return dtype == mx.bfloat16 and width % 8 == 0 and top_k <= 16
 
@@ -1419,6 +1434,27 @@ def combine_experts(y: mx.array, positions: mx.array, weights: mx.array) -> mx.a
     threads = tokens * (width // 8)
     return _kernel("combine", ["y", "pos", "w"], ["out"], _COMBINE)(
         inputs=[y, positions.astype(mx.uint32), weights],
+        template=[("K", k)],
+        grid=(-(-threads // 256) * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(tokens, width)],
+        output_dtypes=[y.dtype],
+    )[0]
+
+
+def combine_shared(
+    y: mx.array, positions: mx.array, weights: mx.array, shared: mx.array, gate: mx.array
+) -> mx.array:
+    """``combine_experts`` plus ``gate * shared``: [tokens, width].
+
+    ``shared`` [tokens, width] is the shared expert's output, ``gate``
+    [tokens] its sigmoid gate.
+    """
+    tokens, k = weights.shape
+    width = y.shape[-1]
+    threads = tokens * (width // 8)
+    return _kernel("combine_shared", ["y", "pos", "w", "sh", "gs"], ["out"], _COMBINE_SHARED)(
+        inputs=[y, positions.astype(mx.uint32), weights, shared, gate],
         template=[("K", k)],
         grid=(-(-threads // 256) * 256, 1, 1),
         threadgroup=(256, 1, 1),
