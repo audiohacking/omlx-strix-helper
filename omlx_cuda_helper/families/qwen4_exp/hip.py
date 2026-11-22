@@ -134,217 +134,124 @@ def available() -> bool:
     return _AVAILABLE
 
 
-# The blocks any of GR neighbouring query rows attends to, a wave a group of
-# rows: each block once, with the rows that take it as a bit mask, ordered by
-# mask and then by block so that the blocks of one set of rows lie together.
-# A row's filling block counts as taken; its keys past the row are masked by
-# their position.
-#
-# sel [rows, TOPK] int32, first int32 [2]: the keys row 0 sees and the width
-# of bm. ub and um [groups, GR * (TOPK + 1)]
-# hold the blocks and masks, uc [groups] their count; bm, tb and tm are
-# scratch: a mask byte per block, and the blocks in block order.
-_QSA_UNION = r"""
-const int lane = threadIdx.x;
-const int g = blockIdx.x;
-const int rows = sel_shape[0], nb = first[1], most = GR * (TOPK + 1);
-unsigned char* bits = bm + size_t(g) * nb;
-for (int i = lane; i < nb / 4; i += 32) reinterpret_cast<unsigned*>(bits)[i] = 0u;
-for (int r = 0; r < GR; ++r) {
-  const int row = g * GR + r;
-  if (row >= rows) break;
-  const int vis = first[0] + row, complete = vis / RATIO;
-  const int count = complete < TOPK ? complete : TOPK;
-  // The blocks of one row differ, so no two lanes write the same byte.
-  for (int j = lane; j < count; j += 32) bits[sel[size_t(row) * TOPK + j]] |= 1u << r;
-  if (lane == 0 && vis > complete * RATIO) bits[complete] |= 1u << r;
-}
-int* blocks = tb + size_t(g) * most;
-unsigned* masks = tm + size_t(g) * most;
-const unsigned below = (1u << lane) - 1u;
-int total = 0;
-for (int i = lane; i - lane < nb; i += 32) {
-  const unsigned mask = bits[i];
-  const unsigned any = fn_ballot(mask != 0u);
-  if (mask != 0u) {
-    const int at = total + __builtin_popcount(any & below);
-    blocks[at] = i;
-    masks[at] = mask;
-  }
-  total += __builtin_popcount(any);
-}
-for (int i = lane; i - lane < total; i += 32) {
-  const unsigned mine = i < total ? masks[i] : 0u;
-  int rank = 0;
-  for (int j = 0; j < total; ++j) {
-    const unsigned other = masks[j];
-    rank += other < mine || (other == mine && j < i);
-  }
-  if (i < total) {
-    ub[size_t(g) * most + rank] = blocks[i];
-    um[size_t(g) * most + rank] = mine;
-  }
-}
-if (lane == 0) uc[g] = total;
-"""
-
-# Attention of GR neighbouring query rows and one KV head a launch block, a
-# wave a row, over the blocks any of the rows takes (``_QSA_UNION``).
-#
-# Neighbouring rows take mostly the same blocks. The block's threads copy 16
-# keys and their values at a time into shared memory, the next ones while the
-# waves work on the current ones, so the rows read each key from memory once
-# between them. A wave skips the keys its row does not take.
+# Attention of one (query row, KV head) a wave over the row's QSA blocks.
 #
 # Scores are taken transposed, keys as rows and the group's query heads as
-# columns: one exchange of the wave's halves leaves a lane with the 16 scores
-# of its head, and the softmax of those keys stays inside the lane. Each
-# weight enters the value product as two bf16 parts, its rounding and the
-# remainder, so that product keeps float32 precision.
+# columns, so both operands are rows of memory as stored. One exchange of the
+# wave's halves then leaves a lane with the 16 scores of its head, and the
+# softmax of a tile stays inside the lane. Each weight enters the value
+# product as two bf16 parts, its rounding and the remainder, so that product
+# keeps float32 precision. Values are read from a copy held as
+# [block][dim][key of the block], the operand of that product as stored.
 #
 # q [KV * G, rows, D], k [KV, keys, D], vt [KV, blocks, D, RATIO] bf16,
-# ub, um, uc of ``_QSA_UNION``, first int32 [1]: keys row 0 sees.
+# sel [rows, TOPK] int32 in key order, first int32 [1]: keys row 0 sees.
 # out [rows, KV * G, D] bf16.
 _QSA = r"""
 constexpr int NT = D / 16;
-constexpr int UNITS = 16 * D / 4;
-constexpr int PER = UNITS / (32 * GR);
-// 16 keys as [key][dim] and their values as [dim][key], in 8-byte units.
-__shared__ v2u held_keys[2][UNITS];
-__shared__ v2u held_values[2][UNITS];
-const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
-const int sub = lane & 15, half = lane >> 4;
-const int R = q_shape[1], keys = k_shape[1], most = ub_shape[1];
-const int g = blockIdx.x / KV, kvh = blockIdx.x % KV;
-const int row = g * GR + wave;
-const bool real = row < R;
+const int lane = threadIdx.x, sub = lane & 15, half = lane >> 4;
+const int R = q_shape[1];
+const int row = blockIdx.x / KV, kvh = blockIdx.x % KV;
+if (row >= R) return;
 const int vis = first[0] + row;
-const int* blocks = ub + size_t(g) * most;
-const unsigned* masks = um + size_t(g) * most;
-const int total = uc[g];
-const int tiles = (total + 3) / 4;
-const hip_bfloat16* kh = k + size_t(kvh) * keys * D;
+const int complete = vis / RATIO;
+const int count = complete < TOPK ? complete : TOPK;
+const int tail = vis - complete * RATIO;
+const int nblk = count + (tail > 0 ? 1 : 0);
+const int* picks = sel + size_t(row) * TOPK;
+const hip_bfloat16* kh = k + size_t(kvh) * k_shape[1] * D;
 const hip_bfloat16* vh = vt + size_t(kvh) * vt_shape[1] * D * RATIO;
-const hip_bfloat16* qh =
-    q + (size_t(kvh * G + (sub < G ? sub : 0)) * R + (real ? row : R - 1)) * D;
-
-// Copy this thread's share of the 16 keys of tile t into buffer p.
-#define FN_STAGE(t, p)                                                         \
-  for (int i = 0; i < PER; ++i) {                                              \
-    const int unit = tid * PER + i;                                            \
-    const int key = unit / (D / 4), slot = unit % 4;                           \
-    const int ku = (t) * 4 + key / RATIO, vu = (t) * 4 + slot;                 \
-    const int at = (ku < total ? blocks[ku] : 0) * RATIO + key % RATIO;        \
-    held_keys[p][unit] = *reinterpret_cast<const v2u_any*>(                    \
-        kh + size_t(at < keys ? at : keys - 1) * D + (unit % (D / 4)) * 4);    \
-    held_values[p][unit] = *reinterpret_cast<const v2u_any*>(                  \
-        vh + (size_t(vu < total ? blocks[vu] : 0) * D + unit / 4) * RATIO);    \
-  }
+const hip_bfloat16* qh = q + (size_t(kvh * G + (sub < G ? sub : 0)) * R + row) * D;
 
 float m = -FN_INF, l = 0.0f;
 v8f o[NT];
 #pragma unroll
 for (int n = 0; n < NT; ++n) o[n] = (v8f){};
 
-FN_STAGE(0, 0)
-__syncthreads();
-for (int t = 0; t < tiles; ++t) {
-  const int p = t & 1;
-  if (t + 1 < tiles) { FN_STAGE(t + 1, p ^ 1) }
-  // The keys of this tile the row takes: its blocks, up to the keys it sees.
-  unsigned take = 0u;
-  if (real) {
+for (int b0 = 0; b0 < nblk; b0 += 16 / RATIO) {
+  const int j = b0 + sub / RATIO;
+  int blk = 0;
+  if (j < count) blk = picks[j];
+  else if (j == count) blk = complete;
+  const hip_bfloat16* kp = kh + (size_t(blk) * RATIO + sub % RATIO) * D;
+
+  v8f s = (v8f){};
 #pragma unroll
-    for (int b = 0; b < 4; ++b) {
-      const int u = t * 4 + b;
-      if (u < total && ((masks[u] >> wave) & 1u)) {
-        const int base = blocks[u] * RATIO;
+  for (int ks = 0; ks < NT; ++ks)
+    s = fn_wmma(fn_load16(kp + ks * 16), fn_load16(qh + ks * 16), s);
+
+  // Element i is key 2 i + half of this lane's head: take the other half's.
+  float sc[16];
 #pragma unroll
-        for (int e = 0; e < RATIO; ++e)
-          if (base + e < vis) take |= 1u << (b * RATIO + e);
-      }
-    }
+  for (int i = 0; i < 8; ++i) {
+    const float other = __shfl_xor(s[i], 16);
+    sc[2 * i] = half ? other : s[i];
+    sc[2 * i + 1] = half ? s[i] : other;
   }
-  if (take != 0u) {
-    v8f s = (v8f){};
+  float tile_max = -FN_INF;
 #pragma unroll
-    for (int ks = 0; ks < NT; ++ks) {
-      union { v16s f; v4u u[2]; } a;
-      const v4u_any* kp =
-          reinterpret_cast<const v4u_any*>(&held_keys[p][sub * (D / 4) + ks * 4]);
-      a.u[0] = kp[0];
-      a.u[1] = kp[1];
-      s = fn_wmma(a.f, fn_load16(qh + ks * 16), s);
-    }
-    // Element i is key 2 i + half of this lane's head: take the other half's.
-    float sc[16];
+  for (int e = 0; e < 16; ++e) {
+    const int at = b0 + e / RATIO;
+    const bool valid = at < count || (at == count && e % RATIO < tail);
+    sc[e] = valid ? sc[e] * INV_SQRT_D : -FN_INF;
+    tile_max = fmaxf(tile_max, sc[e]);
+  }
+  const float next = fmaxf(m, tile_max);
+  const float alpha = m == -FN_INF ? 0.0f : expf(m - next);
+  float sum = 0.0f;
+  v16s ph, pl;
+#pragma unroll
+  for (int e = 0; e < 16; ++e) {
+    const float p = sc[e] == -FN_INF ? 0.0f : expf(sc[e] - next);
+    sum += p;
+    const unsigned high = fn_bf16(p);
+    ph[e] = (short)high;
+    pl[e] = (short)fn_bf16(p - fn_float(high));
+  }
+  l = l * alpha + sum;
+  m = next;
+
+  // The sums so far are rows of heads; scale each by its head's factor.
+  bool moved = false;
+  float scale[16];
+#pragma unroll
+  for (int h = 0; h < 16; ++h) {
+    scale[h] = h < G ? fn_lane(alpha, h) : 1.0f;
+    moved = moved || scale[h] != 1.0f;
+  }
+  if (moved) {
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-      const float other = __shfl_xor(s[i], 16);
-      sc[2 * i] = half ? other : s[i];
-      sc[2 * i + 1] = half ? s[i] : other;
-    }
-    float tile_max = -FN_INF;
+      const float f = half ? scale[2 * i + 1] : scale[2 * i];
 #pragma unroll
-    for (int e = 0; e < 16; ++e) {
-      sc[e] = (take >> e) & 1u ? sc[e] * INV_SQRT_D : -FN_INF;
-      tile_max = fmaxf(tile_max, sc[e]);
-    }
-    const float next = fmaxf(m, tile_max);
-    const float alpha = m == -FN_INF ? 0.0f : expf(m - next);
-    float sum = 0.0f;
-    v16s ph, pl;
-#pragma unroll
-    for (int e = 0; e < 16; ++e) {
-      const float w = sc[e] == -FN_INF ? 0.0f : expf(sc[e] - next);
-      sum += w;
-      const unsigned high = fn_bf16(w);
-      ph[e] = (short)high;
-      pl[e] = (short)fn_bf16(w - fn_float(high));
-    }
-    l = l * alpha + sum;
-    m = next;
-
-    // The sums so far are rows of heads; scale each by its head's factor.
-    bool moved = false;
-    float scale[16];
-#pragma unroll
-    for (int h = 0; h < 16; ++h) {
-      scale[h] = h < G ? fn_lane(alpha, h) : 1.0f;
-      moved = moved || scale[h] != 1.0f;
-    }
-    if (moved) {
-#pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        const float f = half ? scale[2 * i + 1] : scale[2 * i];
-#pragma unroll
-        for (int n = 0; n < NT; ++n) o[n][i] *= f;
-      }
-    }
-#pragma unroll
-    for (int n = 0; n < NT; ++n) {
-      union { v16s f; v4u u[2]; } vf;
-      const v4u_any* vp =
-          reinterpret_cast<const v4u_any*>(&held_values[p][(n * 16 + sub) * 4]);
-      vf.u[0] = vp[0];
-      vf.u[1] = vp[1];
-      o[n] = fn_wmma(ph, vf.f, o[n]);
-      o[n] = fn_wmma(pl, vf.f, o[n]);
+      for (int n = 0; n < NT; ++n) o[n][i] *= f;
     }
   }
-  __syncthreads();
-}
-#undef FN_STAGE
-if (!real) return;
 
-float sums[16];
+  int blocks[16 / RATIO];
 #pragma unroll
-for (int h = 0; h < 16; ++h) sums[h] = h < G ? fn_lane(l, h) : 1.0f;
+  for (int t = 0; t < 16 / RATIO; ++t)
+    blocks[t] = __builtin_amdgcn_readlane(blk, t * RATIO);
+#pragma unroll
+  for (int n = 0; n < NT; ++n) {
+    union { v16s f; v2u u[4]; } vf;
+#pragma unroll
+    for (int t = 0; t < 16 / RATIO; ++t)
+      vf.u[t] = *reinterpret_cast<const v2u_any*>(
+          vh + (size_t(blocks[t]) * D + n * 16 + sub) * RATIO);
+    o[n] = fn_wmma(ph, vf.f, o[n]);
+    o[n] = fn_wmma(pl, vf.f, o[n]);
+  }
+}
+
+float total[16];
+#pragma unroll
+for (int h = 0; h < 16; ++h) total[h] = h < G ? fn_lane(l, h) : 1.0f;
 #pragma unroll
 for (int i = 0; i < 8; ++i) {
   const int head = 2 * i + half;
   if (head >= G) continue;
-  const float inv = half ? sums[2 * i + 1] : sums[2 * i];
+  const float inv = half ? total[2 * i + 1] : total[2 * i];
   hip_bfloat16* y = out + (size_t(row) * KV * G + kvh * G + head) * D + sub;
 #pragma unroll
   for (int n = 0; n < NT; ++n) y[n * 16] = hip_bfloat16(o[n][i] / inv);
@@ -357,8 +264,6 @@ class SparseAttention:
 
     # Query rows of one launch; bounds the selection the caller builds for it.
     rows_per_launch = 2048
-    # Neighbouring rows that share the keys they read.
-    group = 8
 
     @staticmethod
     def fits(heads: int, kv_heads: int, dim: int, ratio: int, dtype: mx.Dtype) -> bool:
@@ -373,24 +278,16 @@ class SparseAttention:
 
     def __init__(self, heads: int, kv_heads: int, dim: int, ratio: int, top_k: int):
         self.heads, self.kv_heads, self.dim, self.ratio = heads, kv_heads, dim, ratio
-        self.top_k = top_k
         self.template = [
             ("KV", kv_heads),
             ("G", heads // kv_heads),
             ("D", dim),
             ("RATIO", ratio),
-            ("GR", self.group),
+            ("TOPK", top_k),
         ]
-        self.union = mx.fast.cuda_kernel(
-            name=f"qwen4_hip_qsa_union_{ratio}_{top_k}_{self.group}",
-            input_names=["sel", "first"],
-            output_names=["ub", "um", "uc", "bm", "tb", "tm"],
-            source=_QSA_UNION,
-            header=_HEADER,
-        )
         self.kernel = mx.fast.cuda_kernel(
-            name=f"qwen4_hip_qsa_{heads}_{kv_heads}_{dim}_{ratio}_{self.group}",
-            input_names=["q", "k", "vt", "ub", "um", "uc", "first"],
+            name=f"qwen4_hip_qsa_{heads}_{kv_heads}_{dim}_{ratio}_{top_k}",
+            input_names=["q", "k", "vt", "sel", "first"],
             output_names=["out"],
             source=_QSA.replace("INV_SQRT_D", f"{float(dim) ** -0.5!r}f"),
             header=_HEADER,
@@ -416,25 +313,6 @@ class SparseAttention:
         cache.blocked = full[:, : cache.offset // self.ratio]
         return full
 
-    def shared(self, selected: mx.array, first_visible: int) -> list[mx.array]:
-        """(blocks, masks, count) of each group of rows: see ``_QSA_UNION``."""
-        rows, group = selected.shape[0], self.group
-        groups = -(-rows // group)
-        most = group * (self.top_k + 1)
-        # A mask byte for every block a row of this launch may take.
-        blocks = (first_visible + rows - 1) // self.ratio + 1
-        blocks = -(-blocks // 128) * 128
-        return self.union(
-            inputs=[selected, mx.array([first_visible, blocks], dtype=mx.int32)],
-            template=[("GR", group), ("RATIO", self.ratio), ("TOPK", self.top_k)],
-            grid=(groups * 32, 1, 1),
-            threadgroup=(32, 1, 1),
-            output_shapes=[(groups, most), (groups, most), (groups,)]
-            + [(groups, blocks), (groups, most), (groups, most)],
-            output_dtypes=[mx.int32, mx.uint32, mx.int32]
-            + [mx.uint8, mx.int32, mx.uint32],
-        )[:3]
-
     def __call__(
         self,
         queries: mx.array,
@@ -449,21 +327,15 @@ class SparseAttention:
         ``selected`` [rows, top_k] holds each row's block ids in key order and
         row ``i`` sees the first ``first_visible + i`` keys.
         """
-        rows, group = queries.shape[2], self.group
+        rows = queries.shape[2]
         if by_block is None:
             by_block = self.by_block(values[0])
         first = mx.array([first_visible], dtype=mx.int32)
         out = self.kernel(
-            inputs=[
-                queries[0],
-                keys[0],
-                by_block,
-                *self.shared(selected, first_visible),
-                first,
-            ],
+            inputs=[queries[0], keys[0], by_block, selected, first],
             template=self.template,
-            grid=(-(-rows // group) * self.kv_heads * 32 * group, 1, 1),
-            threadgroup=(32 * group, 1, 1),
+            grid=(rows * self.kv_heads * 32, 1, 1),
+            threadgroup=(32, 1, 1),
             output_shapes=[(rows, self.heads, self.dim)],
             output_dtypes=[queries.dtype],
         )[0]
