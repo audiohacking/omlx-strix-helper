@@ -17,7 +17,7 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
-from . import kernels
+from . import hip, kernels
 from .ops import Weights, norm, unit_scale
 
 # Chunks shorter than this stay on masked dense attention on the host.
@@ -36,6 +36,8 @@ class QSACache:
         self.positions: mx.array | None = None
         # Normalized, rotated mean key of each complete block.
         self.pooled: mx.array | None = None
+        # Values of the complete blocks as the HIP attention kernel reads them.
+        self.blocked: mx.array | None = None
         self.offset = 0
         # (keys, values, index keys, positions) of the last chunk.
         self.appended: tuple[mx.array, ...] = ()
@@ -60,7 +62,8 @@ class QSACache:
         self.offset = self.keys.shape[2]
 
     def arrays(self) -> list[mx.array]:
-        held = (self.keys, self.values, self.index_keys, self.positions, self.pooled)
+        held = (self.keys, self.values, self.index_keys, self.positions)
+        held += (self.pooled, self.blocked)
         return [a for a in held if a is not None]
 
 
@@ -111,9 +114,10 @@ class Attention:
         self.inv_freq = mx.array((np.float32(1.0) / base**exponent).astype(np.float32))
 
         self._head_sum = _head_sum(self.index_heads, self.index_dim)
-        self.kernel: kernels.SparseAttention | None = None
-        self.selection: kernels.BlockSelection | None = None
-        self.fused_prep = False
+        self.kernel: kernels.SparseAttention | hip.SparseAttention | None = None
+        self.selection: kernels.BlockSelection | hip.BlockSelection | None = None
+        # The kernels module of the fused ``prepare``, once it passes.
+        self.fused_prep: Any = None
 
     def enable_kernels(self) -> None:
         """Use the prep, selection and attention kernels that reproduce the ops."""
@@ -121,7 +125,9 @@ class Attention:
         geometry = (self.heads, self.kv_heads, self.head_dim, self.index_heads)
         half = self.inv_freq.shape[0]
         if kernels.qsa_prep_fits(*geometry, self.index_dim, half, dtype):
-            self.fused_prep = self._prepares_like(dtype)
+            self.fused_prep = kernels
+            if not self._prepares_like(dtype):
+                self.fused_prep = None
         if kernels.BlockSelection.fits(self.index_heads, self.index_dim, dtype):
             selection = kernels.BlockSelection(
                 self.index_heads, self.index_dim, self.ratio, self.top_k
@@ -135,6 +141,39 @@ class Attention:
         kernel = kernels.SparseAttention(
             self.heads, self.kv_heads, self.head_dim, self.ratio, self.top_k
         )
+        if self._attends_like(kernel, dtype):
+            self.kernel = kernel
+
+    def enable_hip(self) -> None:
+        """Use the HIP attention kernel if it reproduces the ops."""
+        dtype = self.q_proj.weight.dtype
+        geometry = (self.heads, self.kv_heads, self.head_dim, self.ratio)
+        if not hip.available():
+            return
+        prep = (self.heads, self.kv_heads, self.head_dim, self.index_heads)
+        half = self.inv_freq.shape[0]
+        if self.fused_prep is None and hip.qsa_prep_fits(
+            *prep, self.index_dim, half, dtype
+        ):
+            self.fused_prep = hip
+            if not self._prepares_like(dtype):
+                self.fused_prep = None
+        if self.selection is None and hip.BlockSelection.fits(
+            self.index_heads, self.index_dim, dtype
+        ):
+            selection = hip.BlockSelection(
+                self.index_heads, self.index_dim, self.ratio, self.top_k
+            )
+            if self._picks_like(selection, dtype):
+                self.selection = selection
+        if self.kernel is not None or not hip.SparseAttention.fits(*geometry, dtype):
+            return
+        kernel = hip.SparseAttention(*geometry, self.top_k)
+        if self._attends_like(kernel, dtype):
+            self.kernel = kernel
+
+    def _attends_like(self, kernel, dtype: mx.Dtype) -> bool:
+        """Whether ``kernel`` gives what ``_gathered`` gives."""
         # Rows around the point where a query stops taking every block, so
         # short selections, every tail length and full selections all occur.
         total = self.budget + 16 * self.ratio
@@ -153,8 +192,35 @@ class Attention:
         )
         want = self._gathered(queries, keys, values, selected, visible)
         got = kernel(queries, keys, values, selected, total - rows + 1)
-        if kernels.close(got, want, "QSA attention"):
-            self.kernel = kernel
+        return kernels.close(got, want, "QSA attention")
+
+    def _picks_like(self, selection: hip.BlockSelection, dtype: mx.Dtype) -> bool:
+        """Whether ``selection`` picks blocks that score what ``_select``'s do.
+
+        The float32 scores of two builds differ in their last bits, so a pick
+        may differ where two blocks all but tie: each row's picks are distinct
+        visible blocks in order, and their reference scores are the best ones.
+        """
+        ratio, blocks = self.ratio, self.top_k + 96
+        # Rows on both sides of ``top_k`` complete blocks, none past the bank.
+        rows = 100 * ratio
+        bank = mx.random.normal((1, blocks, self.index_dim)).astype(dtype)
+        queries = mx.random.normal((rows, self.index_heads, self.index_dim))
+        queries = queries.astype(dtype)
+        first = (self.top_k - 8) * ratio
+        got = selection(queries, bank, first)
+        want = self._select(queries, bank, first)
+        complete = (first + mx.arange(rows, dtype=mx.int32)) // ratio
+        scores = self._block_scores(queries, bank)
+        ordered = mx.all(got[:, 1:] > got[:, :-1]) & mx.all(got[:, 0] >= 0)
+        visible = mx.all(got[:, -1] < mx.maximum(complete, self.top_k))
+        mine = mx.sort(mx.take_along_axis(scores, got, axis=-1), axis=-1)
+        best = mx.sort(mx.take_along_axis(scores, want, axis=-1), axis=-1)
+        same = mx.allclose(mine, best, rtol=1e-5, atol=1e-6)
+        if ordered.item() and visible.item() and same.item():
+            return True
+        kernels.logger.warning("QSA selection kernel differs; using the reference")
+        return False
 
     def _prepares_like(self, dtype: mx.Dtype) -> bool:
         """Whether ``_prepare_fused`` gives what ``prepare`` gives."""
@@ -185,7 +251,7 @@ class Attention:
         """``prepare`` in one launch for rows at positions ``past`` on."""
         rows = q_out.shape[1]
         gate = q_out.reshape(1, rows, self.heads, 2, -1)[..., 1, :].reshape(1, rows, -1)
-        queries, keys, values, index_keys, index_queries = kernels.qsa_prep(
+        queries, keys, values, index_keys, index_queries = self.fused_prep.qsa_prep(
             self, q_out, k_out, v_out, index, past
         )
         return queries, gate, keys, values, index_keys, index_queries
@@ -375,6 +441,9 @@ class Attention:
         pooled = self._pooled(cache)
         kernel = self.kernel if pooled.shape[1] > self.top_k else None
         step = kernel.rows_per_launch if kernel else _REFERENCE_ROWS
+        packed = ()
+        if isinstance(kernel, hip.SparseAttention):
+            packed = (kernel.blocked(cache),)
         outputs = []
         for start in range(first, rows, step):
             stop = min(start + step, rows)
@@ -383,7 +452,7 @@ class Attention:
             selected = self._select(index_queries[start:stop], pooled, seen)
             part = queries[:, :, start:stop]
             if kernel:
-                out = kernel(part, cache.keys, cache.values, selected, seen)
+                out = kernel(part, cache.keys, cache.values, selected, seen, *packed)
             else:
                 out = self._gathered(part, cache.keys, cache.values, selected, visible)
             outputs.append(out)

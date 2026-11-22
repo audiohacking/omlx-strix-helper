@@ -19,7 +19,7 @@ import mlx.nn as nn
 from ... import checkpoint, oqh
 from ...tensors import from_host, unpack
 from ...wire import HostArray
-from . import kernels
+from . import hip, kernels
 from .attention import Attention, QSACache
 from .ops import (
     Weights,
@@ -87,7 +87,8 @@ class HyperConnection:
         self.inject = w.float32("block_inject_weight")
         self.mix = _stream_mixer(self.streams, self.hidden)
         self.square_sums = None
-        self.fused = False
+        # The kernels module of the fused norm and mix, once they pass.
+        self.fused: Any = None
         self.write = write
 
     def parameters(self) -> list[mx.array]:
@@ -104,26 +105,40 @@ class HyperConnection:
             self.streams, self.hidden, dtype
         ):
             return
+        self._take(kernels, dtype)
+
+    def enable_hip(self) -> None:
+        """Take the HIP norm, mix and write kernels if they reproduce the ops."""
+        dtype = self.down.weight.dtype
+        if hip.available() and hip.hc_fits(self.streams, self.hidden, dtype):
+            self._take(hip, dtype)
+
+    def _take(self, fused: Any, dtype: mx.Dtype) -> None:
+        """Use the kernels of ``fused`` if they give the block input, the
+        write gates and the residual write of the ops."""
         h = mx.random.normal((1, 64, self.streams * self.hidden)).astype(dtype)
         want = self(h)
-        self.fused = True
+        self.fused = fused
         got = self(h)
-        self.fused = kernels.close(got[0], want[0], "HC input") and kernels.close(
-            got[1], want[1], "HC gates"
-        )
-        branch = mx.random.normal((1, 64, self.hidden)).astype(dtype)
-        if self.fused and kernels.close(
-            kernels.hc_write(h, branch, want[1]), write(h, branch, want[1]), "HC write"
+        if not (
+            kernels.close(got[0], want[0], "HC input")
+            and kernels.close(got[1], want[1], "HC gates")
         ):
-            self.write = kernels.hc_write
+            self.fused = None
+            return
+        branch = mx.random.normal((1, 64, self.hidden)).astype(dtype)
+        if kernels.close(
+            fused.hc_write(h, branch, want[1]), write(h, branch, want[1]), "HC write"
+        ):
+            self.write = fused.hc_write
 
     def __call__(self, h: mx.array) -> tuple[mx.array, mx.array]:
         """(block input [1, L, hidden], write gates [1, L, streams])."""
         if self.fused:
-            normed, dots = kernels.hc_norm(h, self.scale, self.inject, self.eps)
+            normed, dots = self.fused.hc_norm(h, self.scale, self.inject, self.eps)
             mix = nn.silu(self.down(normed) / self.streams)
             up = self.up(mix)
-            return kernels.hc_mix(up, normed, self.streams), self.gates(dots, h.dtype)
+            return self.fused.hc_mix(up, normed, self.streams), self.gates(dots, h.dtype)
         normed = stream_norm(h, self.scale, self.eps, self.square_sums)
         mix = nn.silu(self.down(normed) / self.streams)
         return self.mix(self.up(mix), normed), self.write_gates(normed)
@@ -183,7 +198,8 @@ class GatedDeltaNet:
         self.taps = w["conv1d.weight"][..., 0].astype(mx.float32)
         self.conv = depthwise_conv
         self.recurrence = mx.fast.gated_delta_update
-        self.fused = False
+        # The kernels module of the fused prework and finish, once they pass.
+        self.fused: Any = None
         self.decay = mx.exp(w["A_log"].astype(mx.float32))
         self.dt_bias = w["dt_bias"]
         self.norm_weight = w["norm.weight"]
@@ -219,7 +235,7 @@ class GatedDeltaNet:
         ):
             self.recurrence = kernels.gated_delta
         if kernels.gdn_glue_fits(self):
-            self.fused = self._glue_matches(dtype)
+            self._take_glue(kernels, dtype)
 
     def enable_hip(self) -> None:
         """Use the qwen3_5 HIP recurrence when it matches the mlx op.
@@ -228,9 +244,9 @@ class GatedDeltaNet:
         graph per token, which is the path the HIP kernel replaces.
         """
 
-        from ..qwen3_5 import kernels as hip
+        from ..qwen3_5 import kernels as shared
 
-        if not hip.hip_jit():
+        if not shared.hip_jit():
             return
         dtype = self.qkv.weight.dtype
         b, t = 1, 16
@@ -244,7 +260,7 @@ class GatedDeltaNet:
         state = 0.01 * mx.random.normal(shape=(b, hv, dv, dk))
         try:
             plain_y, plain_s = mx.fast.gated_delta_update(q, k, v, gamma, beta, state)
-            fast = hip.gated_delta(q, k, v, gamma, beta, state)
+            fast = shared.gated_delta(q, k, v, gamma, beta, state)
             if fast is None:
                 return
             fast_y, fast_s = fast
@@ -257,7 +273,14 @@ class GatedDeltaNet:
             )
             return
         if ok:
-            self.recurrence = hip.gated_delta
+            self.recurrence = shared.gated_delta
+        if hip.available() and hip.gdn_glue_fits(self):
+            self._take_glue(hip, dtype)
+
+    def _take_glue(self, fused: Any, dtype: mx.Dtype) -> None:
+        self.fused = fused
+        if not self._glue_matches(dtype):
+            self.fused = None
 
     def _glue_matches(self, dtype: mx.Dtype) -> bool:
         """Whether the prework and finish kernels reproduce the plain ops."""
@@ -266,8 +289,9 @@ class GatedDeltaNet:
         state = mx.random.normal((1, self.taps.shape[1] - 1, width)).astype(dtype)
         y = mx.random.normal((1, 64, self.value_heads, self.value_dim)).astype(dtype)
         z = mx.random.normal((1, 64, self.value_heads * self.value_dim)).astype(dtype)
+        fused, self.fused = self.fused, None
         want = [*self.prework(qkv, state), self.finish(y, z)]
-        self.fused = True
+        self.fused = fused
         got = [*self.prework(qkv, state), self.finish(y, z)]
         names = ("GDN q", "GDN k", "GDN v", "GDN window", "GDN norm and gate")
         return all(kernels.close(a, b, n) for a, b, n in zip(got, want, names))
@@ -278,7 +302,7 @@ class GatedDeltaNet:
         if state is None:
             state = mx.zeros((1, window, qkv.shape[-1]), dtype=qkv.dtype)
         if self.fused:
-            q, k, v = kernels.gdn_prework(qkv, state, self.taps, self.key_heads)
+            q, k, v = self.fused.gdn_prework(qkv, state, self.taps, self.key_heads)
             tail = mx.concatenate([state, qkv[:, -window:]], axis=1)
             return q, k, v, tail[:, -window:]
         conv_in = mx.concatenate([state, qkv], axis=1)
@@ -301,7 +325,7 @@ class GatedDeltaNet:
         """The recurrence output normalized and gated, [1, rows, value width]."""
         if self.fused:
             z = z.reshape(y.shape)
-            return kernels.gdn_finish(
+            return self.fused.gdn_finish(
                 y, z, self.norm_weight, self.eps, self.sigmoid_gate
             )
         squares = mx.square(y.astype(mx.float32))
@@ -436,6 +460,9 @@ class MoE:
         self.gather = None
         self.swiglu = None
         self.expert_kernel = False
+        # (gate | up, down) as the HIP expert kernel reads them, held instead
+        # of the banks.
+        self.hip_banks: tuple | None = None
 
     @staticmethod
     def _rotation(w: Weights, names: tuple[str, ...]) -> tuple[mx.array, int]:
@@ -486,7 +513,10 @@ class MoE:
             self.shared_down,
             self.shared_scale,
         )
-        banks = [a for bank in (self.gate_up, self.down) for a in bank[:3]]
+        if self.hip_banks is not None:
+            banks = [a for bank in self.hip_banks for a in bank]
+        else:
+            banks = [a for bank in (self.gate_up, self.down) for a in bank[:3]]
         return [a for a in banks if a is not None] + [
             a for layer in linears for a in layer.parameters()
         ]
@@ -527,6 +557,47 @@ class MoE:
             )
         ):
             self.expert_kernel = self._experts_match(dtype)
+
+    def enable_hip(self) -> None:
+        """Use the HIP expert kernel if it gives what gather_qmm gives.
+
+        The banks are then held only in the order that kernel reads them.
+        """
+        dtype, width = self.router.weight.dtype, self.router.weight.shape[1]
+        if not hip.available():
+            return
+        k = self.top_k
+        if self.combine is None and hip.combine_fits(width, k, dtype):
+            y = mx.random.normal((64 * k, 1, width)).astype(dtype)
+            positions = mx.argsort(mx.random.uniform(shape=(64 * k,)))
+            scores = mx.random.uniform(shape=(64, k)).astype(dtype)
+            want = stacked_sum(y[positions].reshape(64, k, -1) * scores[..., None])
+            got = hip.combine_experts(y, positions, scores)
+            if kernels.close(got, want, "MoE sum"):
+                self.combine = hip.combine_experts
+        if (
+            self.hip_banks is not None
+            or self.oqh
+            or dtype != mx.bfloat16
+            or not hip.expert_gemm_fits(self.gate_up, width, act=True)
+            or not hip.expert_gemm_fits(self.down, self.inner)
+        ):
+            return
+        tokens, count = 256, self.gate_up[0].shape[0]
+        keys = mx.random.split(mx.random.key(11), 2)
+        x = mx.random.normal((1, tokens, width), key=keys[0]).astype(dtype)
+        # One expert with more routes than a wave takes at once, the others few.
+        others = mx.random.randint(1, count, (1, tokens, self.top_k - 1), key=keys[1])
+        chosen = mx.concatenate([mx.zeros((1, tokens, 1), mx.int32), others], -1)
+        want = self.experts(x, chosen)[0]
+        self.hip_banks = (hip.expert_bank(self.gate_up), hip.expert_bank(self.down))
+        got = self.experts(x, chosen)[0]
+        mx.eval(want, got)
+        if kernels.close(got, want, "Expert"):
+            self.gate_up = self.down = None
+            mx.clear_cache()
+        else:
+            self.hip_banks = None
 
     def _experts_match(self, dtype: mx.Dtype) -> bool:
         """Whether the expert kernel path gives the bits of gather_qmm.
@@ -617,6 +688,13 @@ class MoE:
         # gather_qmm takes its sorted expert kernel, whose sums this kernel
         # reproduces, from four routes an expert on. oQh banks take the
         # kernel at any count: gather_qmm has no form for some of them.
+        if self.hip_banks is not None:
+            # Each route reads its token's row; gate, up and SwiGLU in one launch.
+            gate_up, down = self.hip_banks
+            src = (order // k).astype(mx.uint32)
+            offsets = kernels.expert_offsets(ids, gate_up[0].shape[0])
+            hidden = hip.expert_gemm(rows, gate_up, offsets, src, act=True)
+            return hip.expert_gemm(hidden, down, offsets)[:, None], mx.argsort(order)
         count = self.gate_up[0].shape[0]
         if self.expert_kernel and (self.oqh or ids.shape[0] >= 4 * count):
             # Each route reads its token's row; gate, up and SwiGLU in one launch.
@@ -684,10 +762,9 @@ class Layer:
             block.enable_kernels()
 
     def enable_hip(self) -> None:
-        """The linear layers take the HIP recurrence. QSA and MoE stay on the ops."""
-        enable = getattr(self.mixer, "enable_hip", None)
-        if enable is not None:
-            enable()
+        """Switch each block to the HIP kernels that pass their self-check."""
+        for block in (self.attn_hc, self.mlp_hc, self.mixer, self.mlp):
+            block.enable_hip()
 
     def new_cache(self) -> Any:
         if self.qsa:
