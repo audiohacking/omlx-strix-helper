@@ -860,6 +860,7 @@ for (int ogi = 0; ogi < NG; ++ogi) {
 
 # Down projection: one wave, four output groups, the short K streamed once.
 _EXPERTS_TIGHT_DOWN = r"""
+__shared__ float rowsum[16];
 constexpr int GROUPS = K / 64;
 constexpr int NG = 4;
 const int sub = threadIdx.x & 15, half = threadIdx.x >> 4;
@@ -871,13 +872,6 @@ if (og0 >= N / 16 || r0 >= end) return;
 const int row = r0 + sub;
 const int live = row < end ? row : end - 1;
 const int id = GATHER ? (int)src[live] : live;
-int rsel[8];
-#pragma unroll
-for (int i = 0; i < 8; ++i) {
-  const int even = __builtin_amdgcn_readlane(id, 2 * i);
-  const int odd = __builtin_amdgcn_readlane(id, 2 * i + 1);
-  rsel[i] = half ? odd : even;
-}
 v8f acc[NG];
 const unsigned* wc[NG];
 #pragma unroll
@@ -888,8 +882,20 @@ for (int ogi = 0; ogi < NG; ++ogi) {
 const hip_bfloat16* xp = x + (size_t)id * K;
 for (int g = 0; g < GROUPS; ++g) {
   v16s a[4];
+  float mine = 0.0f;
 #pragma unroll
-  for (int ks = 0; ks < 4; ++ks) a[ks] = fn_load16(xp + g * 64 + ks * 16);
+  for (int ks = 0; ks < 4; ++ks) {
+    a[ks] = fn_load16(xp + g * 64 + ks * 16);
+    // The group sum of the row, added as the gate kernel adds it.
+#pragma unroll
+    for (int d = 0; d < 8; ++d)
+      mine += fn_float((unsigned short)a[ks][d]) + fn_float((unsigned short)a[ks][d + 8]);
+  }
+  if (half == 0) rowsum[sub] = mine;
+  __syncthreads();
+  float gsum[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) gsum[i] = rowsum[2 * i + half];
 #pragma unroll
   for (int ogi = 0; ogi < NG; ++ogi) {
     v8f p = {};
@@ -901,7 +907,7 @@ for (int g = 0; g < GROUPS; ++g) {
     const float scale = fn_float(both & 0xffffu), bias = fn_float(both >> 16);
 #pragma unroll
     for (int i = 0; i < 8; ++i)
-      acc[ogi][i] += scale * p[i] + bias * xs[(size_t)rsel[i] * GROUPS + g];
+      acc[ogi][i] += scale * p[i] + bias * gsum[i];
   }
 }
 #pragma unroll
@@ -1001,17 +1007,17 @@ def _expert_tight_down(x, codes, both, offsets, src, inputs, width, count):
     if _TIGHT_DOWN is None:
         _TIGHT_DOWN = mx.fast.cuda_kernel(
             name="qwen4_hip_experts_tight_down",
-            input_names=["x", "xs", "w", "sb", "offsets", "src"],
+            input_names=["x", "w", "sb", "offsets", "src"],
             output_names=["y"],
             source=_EXPERTS_TIGHT_DOWN,
             header=_HEADER,
+            shared_memory=64,
         )
     rows = x.shape[0]
     routes = rows if src is None else src.shape[0]
-    sums = x.reshape(rows, inputs // 64, 64).astype(mx.float32).sum(axis=-1)
     tiles = _tight_tiles(offsets, routes)
     return _TIGHT_DOWN(
-        inputs=[x, sums, codes, both, offsets, offsets if src is None else src],
+        inputs=[x, codes, both, offsets, offsets if src is None else src],
         template=[("K", inputs), ("N", width), ("GATHER", int(src is not None))],
         grid=(tiles * 32, width // 64, count),
         threadgroup=(32, 1, 1),
