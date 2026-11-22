@@ -53,7 +53,7 @@ The Mac holds the weights, the cache, and generation. From 2,048 tokens up, the 
 
 ## On the Radeon
 
-Three things carry that prefix.
+Three things carry the 27B prefix.
 
 **Gated delta** is one HIP launch per layer. `patches/rocm-cuda-kernel-hip.patch` forwards `mx.fast.cuda_kernel` to the HIP JIT, and the recurrence runs on the GPU. One lane owns one value row and keeps its state in registers, so a step waits on no memory. The stock ROCm op builds a graph per token and leaves the shader arrays idle.
 
@@ -62,6 +62,16 @@ Three things carry that prefix.
 **The steps between** the matrix products are one kernel each: the causal conv with its norms, the output gate, the MLP activation. As separate MLX ops they took a quarter of a chunk. Dense weights are stored as `[in, out]`, the operand hipBLASLt multiplies fastest.
 
 Each kernel is checked against the plain ops when a model loads. A layer that fails a check keeps the plain ops.
+
+Flash-Next takes its own kernels on the same JIT. The Mac cuts its prompts into 4,096-token chunks, and the kernels are measured at that size.
+
+**Experts** run as two launches per layer, gate and up with their SwiGLU, then down, straight from the oQ4e codes: one wave owns 16 routes of one expert. A code becomes bf16 in one `v_cvt_f32_ubyte` and half a permute, and a group's sum is `scale * sum(x * code) + bias * sum(x)` in float32. The banks are held in the order a wave reads them, not as MLX's packed weights.
+
+**Sparse attention** gathers each query row's 512 selected blocks of four keys. A wave keeps its slice of the 12 query heads in registers, and the next block id loads while the current keys do. On real text a 4,096-row chunk takes about 26 ms at any past from 4K to 61K. The block selection reads each row's scores once into the registers of up to 32 waves, which count the radix passes there; at a 32K past it takes 2.6 ms where one wave re-reading memory took 9.3.
+
+**Hyper-connections and the gated delta** keep fused norm, mix and write kernels and the 27B recurrence. Each linear is stored either way round, `[in, out]` or `[out, in]`, whichever hipBLASLt multiplies faster for its shape, timed once when the model loads.
+
+This ROCm build runs `x[0]` on a `[1, ...]` array as a gather: 36 ms for the keys of a 61K cache, against 0.04 ms for `mx.squeeze`. The attention path takes views.
 
 ## Models
 
