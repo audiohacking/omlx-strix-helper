@@ -41,9 +41,9 @@ Prefill tok/s on a 64K prompt, oQ4e, M3 Ultra 512 GB. The Spark and A6000 column
 | Model | M3 Ultra alone | + Strix Halo | + DGX Spark | + 2x RTX A6000 |
 | --- | ---: | ---: | ---: | ---: |
 | Qwen3.8 27B | 352 | 831 (+136%) | 1,062 (+202%) | 1,879 (+434%) |
-| Qwen3.8 Flash-Next | 1,370 | ~2,000 (+83%) | 2,715 (+98%) | 3,928 (+187%) |
+| Qwen3.8 Flash-Next | 1,370 | ~2,130 (+94%) | 2,715 (+98%) | 3,928 (+187%) |
 
-The 27B Strix cell is the 65,536 row above, over Thunderbolt. The Flash-Next Strix cell is a 65,536-token prompt over Thunderbolt with the layer count on Auto (it settles at 17 of 48): 1,975 to 2,090 tok/s over six runs. Its percentage is against this Mac alone on the same day, 1,072 to 1,118 tok/s; the 1,370 in that column is the release’s machine. The Halo runs the first layers of one chunk while the Mac runs the rest of the one before, so a helper slower than the Mac still adds its pace. oMLX cuts Flash-Next prompts into 4,096-token chunks.
+The 27B Strix cell is the 65,536 row above, over Thunderbolt. The Flash-Next Strix cell is a 65,536-token prompt over Thunderbolt with the Halo on 20 of 48 layers: 2,080 to 2,154 tok/s over three runs. Auto settles at 22 and reads 1,941 to 2,096. The percentage is against this Mac alone on the same day, 1,072 to 1,118 tok/s; the 1,370 in that column is the release’s machine. The Halo runs the first layers of one chunk while the Mac runs the rest of the one before, so a helper slower than the Mac still adds its pace. oMLX cuts Flash-Next prompts into 4,096-token chunks.
 
 At 32,768 tokens the draft copies 49 of 49 eligible prompt tokens, and decode reads 163 tok/s. At 65,536 the Mac drafts new tokens at 66 tok/s.
 
