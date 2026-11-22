@@ -24,9 +24,8 @@ Prefill tok/s on a 64K-token prompt with an M3 Ultra (512 GB), oQ4e checkpoints,
 | Qwen3.8 27B | 352 | 831 (+136%) | 1,062 (+202%) | 1,879 (+434%) |
 | Qwen3.8 Flash-Next | 1,370 | 2,160 (+97%\*) | 2,715 (+98%) | 3,928 (+187%) |
 
-The M3 Ultra alone, DGX Spark, and RTX A6000 figures are from the [oMLX 0.8.0 release](https://github.com/jundot/omlx/releases/tag/v0.8.0), over 2.5 GbE. The Strix Halo figures are over Thunderbolt.
-
-\* Against the same Mac alone, 1,095 tok/s.
+* The M3 Ultra alone, DGX Spark, and RTX A6000 figures are from the [oMLX 0.8.0 release](https://github.com/jundot/omlx/releases/tag/v0.8.0), over 2.5 GbE. 
+* The Strix Halo figures are over Thunderbolt.
 
 M3 Ultra with one Strix Halo, 64 generated tokens, MTP on:
 
