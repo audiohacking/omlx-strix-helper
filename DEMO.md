@@ -1,21 +1,19 @@
-# Demo
+# Setup
 
-One M3 Ultra and one Strix Halo. The Mac runs oMLX, holds the weights, the KV cache, and decode. From 2,048 tokens up, the Halo prefills layers `[0, K)` and returns the hidden state plus the cache rows. The Mac runs the layers that remain. Prompts shorter than that, and any prompt with an image, stay on the Mac.
-
-The numbers in the README are this setup. Qwen3.8 27B oQ4e, 65,536-token prompt, 64 generated tokens, MTP on: **831 prefill tok/s, 66 decode tok/s**. Qwen3.8 Flash-Next oQ4e, the same prompt: **about 2,160 prefill tok/s** against 1,072 to 1,118 for the Mac alone. The same prompts on the gigabit port are not this demo.
+One Mac running oMLX and one Strix Halo running this helper. The Mac holds the weights, the KV cache, and decode. For prompts of 2,048 tokens and up, the Halo prefills the first K layers of each chunk and returns the hidden state plus the cache rows; the Mac runs the layers that remain. Shorter prompts, and prompts with images, stay on the Mac.
 
 ## Machines
 
-- **Mac.** M3 Ultra, 512 GB. oMLX from the [audiohacking/omlx](https://github.com/audiohacking/omlx) fork, not the upstream app, the Homebrew tap, or a release dmg. The fork is jundot/omlx plus the Thunderbolt bridge picker (`d19de537` on `main`).
-- **Halo.** Minisforum MS-S1 MAX. Ryzen AI Max+ 395, Radeon 8060S, gfx1151, 40 CUs. BIOS power mode **Balanced**. Performance mode raises the power cap, the GPU hits the thermal limit, and the same 64K prompt comes back slower. Leave the firmware in Balanced. Clock sysfs is not part of the setup. Under Balanced a long prompt holds the GPU near 2.65 GHz and 120 W for about ten seconds, then near 2.4 GHz and 108 W.
+- **Mac.** Apple silicon with enough memory for the model; the results in the README use an M3 Ultra with 512 GB. Run oMLX from the [audiohacking/omlx](https://github.com/audiohacking/omlx) fork when the cable is Thunderbolt (see below). Stock oMLX is fine on 10G.
+- **Strix Halo.** Ryzen AI Max+ 395 with the Radeon 8060S (gfx1151), for example the Minisforum MS-S1 MAX. Keep the BIOS power mode on **Balanced**: Performance raises the power cap, and under sustained prefill the GPU can reach its thermal limit and slow down.
 
 ## The cable
 
-Prefill crosses one cable. A direct 10G link, or both machines on a 10G switch, is the one to use when it exists. It reports a real media speed, stock oMLX will select it, and it can be faster than the bridge. The README row was measured on the Thunderbolt bridge because that was the fast cable on this desk.
+Prefill data crosses one cable. A direct 10G link, or both machines on a 10G switch, is the simplest choice: it reports a media speed, and stock oMLX selects it. A Thunderbolt bridge works as well and is what the README results use.
 
 ```mermaid
 flowchart LR
-  Mac["M3 Ultra\noMLX · decode, KV, API"]
+  Mac["Mac\noMLX · decode, KV, API"]
   Halo["Strix Halo\nprefill · layers 0…K"]
 
   Mac -->|"preferred\ndirect 10G cable,\nor a 10G switch"| Halo
@@ -29,17 +27,15 @@ flowchart LR
   linkStyle 2 stroke:#9a9a9a,stroke-dasharray:4 3
 ```
 
-The Halo's Thunderbolt interface negotiates 80 Gbit/s and has no DHCP lease. The Mac reaches it at that interface's IPv6 link-local address, scoped to `bridge0`. The member port is in the bridge and has no address of its own. `ifconfig` reports `media: autoselect` for the bridge, with no `1000baseT`-style speed.
+Over Thunderbolt, the Halo's interface negotiates 80 Gbit/s and has no DHCP lease. The Mac reaches it at that interface's IPv6 link-local address, scoped to `bridge0`. Stock oMLX only ranks interfaces that report a numeric media speed, so it would stay on the shared gigabit network; the fork ranks the bridge by the 80 Gbit/s the Halo reports. While the bridge answers, the fork prefers it over a 10G port, so leave the bridge down when 10G is the path you want.
 
-Stock oMLX discovers the helper on the network both machines share and stays there. It drops 169.254 addresses, and it only ranks interfaces that report a numeric media speed, so a bridge never wins against gigabit. A 10G port does report a speed, which is why that path needs no fork. The fork ranks the bridge by the 80 Gbit/s the Halo reports. While the bridge answers, that rank beats a 10G NIC, so leave the bridge down when the 10G path is the one you want.
+After Pair, Check shows the cable in use: **10000 Mbit/s** on 10G, **80000 Mbit/s** on the bridge. **1000 Mbit/s** means the traffic is on the gigabit port.
 
-After Pair, Check shows the cable actually in use. On 10G that is the 10G address at **10000 Mbit/s**. On the bridge it is the link-local address at **80000 Mbit/s**. A pass on a 1000 Mbit/s Ethernet address is the wrong cable. Unscoped 169.254 traffic follows whichever interface already owns that route; do not send the cable's traffic out the gigabit port.
-
-This helper reports version 0.1.9. Current oMLX expects 0.1.7 or newer. The family rows are `qwen3_5` for the 27B and `qwen4_exp` for Flash-Next.
+The helper reports version 0.1.9; oMLX expects 0.1.7 or newer.
 
 ## Mac
 
-oMLX runs here and is not part of this repo. This repo builds the helper only. The Mac needs the [audiohacking/omlx](https://github.com/audiohacking/omlx) fork so it will select a Thunderbolt bridge; stock oMLX is fine when the cable is 10G. Install that fork the same way as upstream oMLX:
+oMLX is not part of this repo. To install the fork:
 
 ```bash
 git clone https://github.com/audiohacking/omlx.git
@@ -48,26 +44,26 @@ make install
 .venv/bin/omlx serve --host 0.0.0.0 --port 8000
 ```
 
-Place the model where that server already loads models. The measured checkpoint is `Qwen3.8-27B-oQ4e`.
+Place the model where that server loads models. Both machines must use the same checkpoint.
 
-On that model:
+Recommended settings for `Qwen3.8-27B-oQ4e`:
 
-- Prefill helper: the paired Halo. Layer count stays on Auto.
-- MTP on. VLM MTP off.
-- Native bf16 KV. Float16 activations off. TurboQuant off. Affine KV off. INT8 activation prefill off. Those four were measured and lost prefill, decode, or both.
-- ANE prefill on. Sequence 2048, fraction 0.53, dual ANE, GDN fraction 0.5, GDN layers capped at 48, tail padding from 512 tokens. ANE and the helper are independent: the Halo never runs the ANE graph.
+- Prefill helper: the paired Halo, layer count on Auto.
+- MTP on, VLM MTP off.
+- Native bf16 KV. Float16 activations, TurboQuant, affine KV, and INT8 activation prefill off.
+- ANE prefill on: sequence 2048, fraction 0.53, dual ANE, GDN fraction 0.5, GDN layers capped at 48, tail padding from 512 tokens. ANE and the helper work independently.
 - Speculative prefill and DFlash off.
 
-For `Qwen3.8-Flash-Next-oQ4e-mtp` (the same file on both machines):
+Recommended settings for `Qwen3.8-Flash-Next-oQ4e-mtp`:
 
-- Prefill helper: the paired Halo, layer count **20 or 21** of 48. Auto settles at 22, a layer or two past the balance, and reads a few percent lower.
-- MTP on. The other settings stay at their defaults.
+- Prefill helper: the paired Halo, layer count **20 or 21** of 48. Auto works too and lands close to that.
+- MTP on. Other settings at their defaults.
 
-Decode stays on the Mac either way. The helper never decodes.
+Decode always stays on the Mac.
 
 ## Halo
 
-The container is this worker only, the alternative to `jundot/omlx-cuda-helper`. A release of this repo builds that image and nothing else: oMLX is not in it, and the release action does not build oMLX. On the Halo:
+With Docker:
 
 ```bash
 docker run -d --name omlx-helper --restart unless-stopped \
@@ -79,16 +75,11 @@ docker run -d --name omlx-helper --restart unless-stopped \
 docker logs -f omlx-helper
 ```
 
-Inside the image is the helper process: ROCm SDK `10.3.0a20261120`, the MLX library at `fc344c9` with the gfx1151 ROCm overlay, and `libgufo_attn.so` already compiled. MLX here is the array library, not the oMLX server. The volume is the helper's state. Pass `--name halo` after the image name to set the Cluster tab name.
+The image contains the helper only: ROCm SDK `10.3.0a20261120`, MLX `fc344c9` with the gfx1151 ROCm overlay, and the attention library already compiled. The volume holds the helper's state. Pass `--name halo` after the image name to set the name shown in the Cluster tab.
 
-The worker speaks the CUDA helper protocol on purpose: `control` is `agent`, `backends` is `["cuda"]`, discovery is `_omlx._tcp.local.`, ports are 8850 (http), 8851 (control), and 8852 (data). The import package is `omlx_cuda_helper`. It serves the six families of the CUDA helper; `qwen3_5` and `qwen4_exp` have measured kernels, the other four replay their contract fixtures on plain ops.
+The helper speaks the CUDA helper protocol: discovery on `_omlx._tcp.local.`, ports 8850 (http), 8851 (control), and 8852 (data).
 
-The measured stack is MLX `fc344c9` with the mlxcel ROCm overlay and ROCm `10.3.0a20261120`. Two patches in this repo belong on that build:
-
-- `patches/rocm-cuda-kernel-hip.patch` forwards `mx.fast.cuda_kernel` to the HIP JIT, which is what runs the gated-delta recurrence in one launch.
-- `patches/nvfp4-gfx1151-hipcc.patch` gets hipcc 7.18 past `nvfp4_gather_expert_batched_kernel` on gfx1151. This checkpoint never takes that kernel.
-
-Build the attention library on the Halo. It is gitignored.
+To run from source instead, install the MLX build above with the two patches in `patches/` (`rocm-cuda-kernel-hip.patch` forwards `mx.fast.cuda_kernel` to the HIP JIT; `nvfp4-gfx1151-hipcc.patch` fixes a hipcc 7.18 build stop on gfx1151), then build the attention library:
 
 ```bash
 hipcc -O3 -shared -fPIC --offload-arch=gfx1151 -std=c++20 \
@@ -96,9 +87,7 @@ hipcc -O3 -shared -fPIC --offload-arch=gfx1151 -std=c++20 \
   -o omlx_cuda_helper/families/qwen3_5/libgufo_attn.so
 ```
 
-Dense linears go through hipBLASLt, with each weight stored as `[in, out]`. Attention is Gufo's packed WMMA kernel (`WmmaCausalAttention<32,16,true>`) over a packed cache each layer keeps for the prompt.
-
-Install and serve from this repo, with `rocm-sdk` on `PATH` and `ROCM_PATH` set to that SDK:
+Install and serve, with `rocm-sdk` on `PATH` and `ROCM_PATH` set to that SDK:
 
 ```bash
 python3 -m venv .venv
@@ -109,15 +98,11 @@ export LD_LIBRARY_PATH="$ROCM_PATH/lib:$HOME/rocm-env/lib${LD_LIBRARY_PATH:+:$LD
 omlx-strixworker serve --name halo
 ```
 
-State lives in `~/.omlx-cuda-helper`. Pass `--pair` only for a helper that is not paired yet. A paired helper is joined from the Mac: Cluster, Find devices, Pair, Check.
+State lives in `~/.omlx-cuda-helper`. Pair from the Mac: Cluster, Find devices, Pair, Check. Pass `--pair` only to join an oMLX that has not paired this helper yet.
 
-## What the 831 run is
+## Troubleshooting
 
-Balanced firmware, the bridge at 80 Gbit/s, native bf16, ANE and MTP on, hipBLASLt for the linears, one packed attention launch per full-attention layer. Auto picks how the 64 layers split, and on this desk it settles at 37 on the Halo. The link is tens of milliseconds. Early in the prompt the Halo is the slower side by a little. Late in the prompt the Mac's remaining layers are the long pole.
-
-A repeat of the 64K prompt on that bridge lands within about 1% of the README row. The first prompt after a helper update can come in lower: Auto is still on the split it learned from the old helper. A 10G cable or a 10G switch is the preferred substitute, and it can come out ahead of the bridge; there is no 10G row in the table yet. Treat a result near 300 tok/s as the gigabit port, or as the helper having been dropped, and check the cable before changing a kernel.
-
-
-## What the Flash-Next run is
-
-Balanced firmware, the bridge at 80 Gbit/s, 4,096-token chunks, the Halo on the first 20 or 21 layers. The Halo is the slower side for the whole prompt: it never waits on the Mac, and a chunk takes about 1.6 s at the start and 1.9 s at the end, as the power limit brings the clock down and the attention past grows. Four runs read 2,158 to 2,174 tok/s; a run right after others can read near 2,000. With `STRIX_CHUNK_LOG=1` in the helper's environment, each chunk logs how long it waited for the Mac and how long it ran.
+- **Prefill close to the Mac's own speed.** Check that the cable reads 10000 or 80000 Mbit/s in Check. A gigabit path, or a helper that dropped out, looks like this.
+- **First prompt after an update is slower.** With the layer count on Auto, oMLX first re-measures both sides; later prompts settle.
+- **Speed drops over long sessions.** The Halo's GPU clock comes down under sustained load. Balanced firmware keeps that drop small.
+- **Per-chunk timing.** Start the helper with `STRIX_CHUNK_LOG=1` to log, for each chunk, how long the Halo waited for the Mac and how long it computed. A Halo that never waits is the slower side; a larger layer count then makes things slower, a smaller one faster.
