@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import mlx.core as mx
@@ -20,12 +21,67 @@ class Linear:
 
     def __init__(self, weight: mx.array):
         self.weight = weight
+        # True once ``weight`` is held as [in, out].
+        self.columns = False
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """(out, in) whichever way the weight is held."""
+        out, inputs = self.weight.shape
+        return (inputs, out) if self.columns else (out, inputs)
 
     def parameters(self) -> list[mx.array]:
         return [self.weight]
 
+    def lay_columns(self) -> None:
+        if not self.columns:
+            self.weight = mx.contiguous(self.weight.T)
+            self.columns = True
+
     def __call__(self, x: mx.array) -> mx.array:
-        return x @ self.weight.T
+        return x @ (self.weight if self.columns else self.weight.T)
+
+
+# Rows of the timing product: the chunk oMLX sends this family.
+_LAYOUT_ROWS = 4096
+# (out, in, dtype) -> whether a stored [in, out] weight is the faster product.
+_COLUMNS: dict[tuple, bool] = {}
+
+
+def _seconds(fn, reps: int = 5) -> float:
+    mx.eval(fn())
+    mx.synchronize()
+    best = float("inf")
+    for _ in range(reps):
+        began = time.perf_counter()
+        mx.eval(fn())
+        mx.synchronize()
+        best = min(best, time.perf_counter() - began)
+    return best
+
+
+def prefer_columns(linear: Linear, close) -> None:
+    """Hold ``linear`` as [in, out] if that product is faster for its shape
+    and ``close(got, want, what)`` accepts it against the [out, in] one.
+
+    hipBLASLt takes another kernel for a stored operand than for a
+    transposed view, faster for some shapes and slower for others: the
+    choice is timed once per shape and reused by every layer.
+    """
+    if linear.columns:
+        return
+    weight = linear.weight
+    key = (*weight.shape, weight.dtype)
+    if key not in _COLUMNS:
+        x = mx.random.normal((1, _LAYOUT_ROWS, weight.shape[1])).astype(weight.dtype)
+        stored = mx.contiguous(weight.T)
+        mx.eval(x, stored)
+        view = _seconds(lambda: x @ weight.T)
+        faster = _seconds(lambda: x @ stored) < 0.95 * view
+        _COLUMNS[key] = faster and close(x @ stored, x @ weight.T, "Stored linear")
+        del stored
+    if _COLUMNS[key]:
+        linear.lay_columns()
 
 
 class Weights:

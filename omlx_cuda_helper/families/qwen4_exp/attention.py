@@ -247,10 +247,10 @@ class Attention:
         """Whether ``_prepare_fused`` gives what ``prepare`` gives."""
         rows, past = 64, 1000
         widths = (
-            self.q_proj.weight.shape[0],
-            self.k_proj.weight.shape[0],
-            self.v_proj.weight.shape[0],
-            self.index_proj.weight.shape[0],
+            self.q_proj.shape[0],
+            self.k_proj.shape[0],
+            self.v_proj.shape[0],
+            self.index_proj.shape[0],
         )
         outs = [mx.random.normal((1, rows, w)).astype(dtype) for w in widths]
         positions = mx.arange(past, past + rows, dtype=mx.int32)

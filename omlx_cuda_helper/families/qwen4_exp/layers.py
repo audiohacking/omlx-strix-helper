@@ -22,8 +22,10 @@ from ...wire import HostArray
 from . import hip, kernels
 from .attention import Attention, QSACache
 from .ops import (
+    Linear,
     Weights,
     depthwise_conv,
+    prefer_columns,
     row_sum,
     stacked_sum,
     stream_norm,
@@ -290,7 +292,7 @@ class GatedDeltaNet:
 
     def _glue_matches(self, dtype: mx.Dtype) -> bool:
         """Whether the prework and finish kernels reproduce the plain ops."""
-        width = self.qkv.weight.shape[0]
+        width = self.qkv.shape[0]
         qkv = mx.random.normal((1, 64, width)).astype(dtype)
         state = mx.random.normal((1, self.taps.shape[1] - 1, width)).astype(dtype)
         y = mx.random.normal((1, 64, self.value_heads, self.value_dim)).astype(dtype)
@@ -536,7 +538,7 @@ class MoE:
             self.enable_hip()
             return
         k, dtype = self.top_k, self.router.weight.dtype
-        y = mx.random.normal((64 * k, 1, self.router.weight.shape[1])).astype(dtype)
+        y = mx.random.normal((64 * k, 1, self.router.shape[1])).astype(dtype)
         positions = mx.argsort(mx.random.uniform(shape=(64 * k,)))
         scores = mx.random.uniform(shape=(64, k)).astype(dtype)
         want = stacked_sum(y[positions].reshape(64, k, -1) * scores[..., None])
@@ -544,7 +546,7 @@ class MoE:
             kernels.combine_experts(y, positions, scores), want, "MoE sum"
         ):
             self.combine = kernels.combine_experts
-        x = mx.random.normal((64, self.router.weight.shape[1])).astype(dtype)
+        x = mx.random.normal((64, self.router.shape[1])).astype(dtype)
         src = mx.random.randint(0, 64, (64 * k,)).astype(mx.uint32)
         if x.shape[1] * dtype.size % 16:
             return
@@ -574,7 +576,7 @@ class MoE:
 
         The banks are then held only in the order that kernel reads them.
         """
-        dtype, width = self.router.weight.dtype, self.router.weight.shape[1]
+        dtype, width = self.router.weight.dtype, self.router.shape[1]
         if not hip.available():
             return
         k = self.top_k
@@ -620,7 +622,7 @@ class MoE:
         """
         tokens, count = 256, self.gate_up[0].shape[0]
         keys = mx.random.split(mx.random.key(11), 2)
-        width = self.router.weight.shape[1]
+        width = self.router.shape[1]
         x = mx.random.normal((1, tokens, width), key=keys[0]).astype(dtype)
         # The oQh reference rebuilds the experts in use dense: keep them few.
         spread = min(count, 4 * self.top_k) if self.oqh else count
@@ -773,11 +775,22 @@ class Layer:
         blocks = [self.attn_hc, self.mlp_hc, self.mixer, self.mlp]
         for block in blocks if self.ple is None else [*blocks, self.ple]:
             block.enable_kernels()
+        if not kernels.available():
+            self._lay_out()
 
     def enable_hip(self) -> None:
         """Switch each block to the HIP kernels that pass their self-check."""
         for block in (self.attn_hc, self.mlp_hc, self.mixer, self.mlp):
             block.enable_hip()
+        self._lay_out()
+
+    def _lay_out(self) -> None:
+        """Hold each linear of the blocks the way hipBLASLt multiplies faster."""
+        for block in (self.attn_hc, self.mlp_hc, self.mixer, self.mlp):
+            for linear in vars(block).values():
+                if isinstance(linear, Linear):
+                    prefer_columns(linear, kernels.close)
+        mx.clear_cache()
 
     def new_cache(self) -> Any:
         if self.qsa:
