@@ -23,7 +23,7 @@ After Pair, Check shows the cable in use. 10G reads **10000 Mbit/s**. The bridge
 
 ## Status
 * Super Alpha!
-* Only tested with `Qwen3.8-27B-oQ4e`
+* Paired prefill measured on `Qwen3.8-27B-oQ4e` and `Qwen3.8-Flash-Next-oQ4e-mtp`.
 
 ## Results (WIP)
 
@@ -36,14 +36,14 @@ Qwen3.8 27B oQ4e. M3 Ultra 512 GB and one Strix Halo over Thunderbolt. 64 genera
 | 32,768 | 938 | 163 |
 | 65,536 | 831 | 66 |
 
-Same model, 64K prompt, M3 Ultra 512 GB. The Spark and A6000 rows are the oMLX 0.8.0 release, a CUDA helper over 2.5 GbE. Decode stays on the Mac in every row.
+Prefill tok/s on a 64K prompt, oQ4e, M3 Ultra 512 GB. The Spark and A6000 columns are the [oMLX 0.8.0](https://github.com/jundot/omlx/releases/tag/v0.8.0) release, a CUDA helper over 2.5 GbE. Decode stays on the Mac in every paired row. The Strix column is this worker.
 
-| 64K prefill | tok/s |
-| --- | ---: |
-| M3 Ultra alone | 352 |
-| + Strix Halo | 831 |
-| + DGX Spark | 1,062 |
-| + 2× RTX A6000 | 1,879 |
+| Model | M3 Ultra alone | + Strix Halo | + DGX Spark | + 2x RTX A6000 |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen3.8 27B | 352 | 831 (+136%) | 1,062 (+202%) | 1,879 (+434%) |
+| Qwen3.8 Flash-Next | 1,370 | ~2,000 (+83%) | 2,715 (+98%) | 3,928 (+187%) |
+
+The 27B Strix cell is the 65,536 row above, over Thunderbolt. The Flash-Next Strix cell is a 65,536-token prompt over Thunderbolt with the layer count on Auto (it settles at 17 of 48): 1,975 to 2,090 tok/s over six runs. Its percentage is against this Mac alone on the same day, 1,072 to 1,118 tok/s; the 1,370 in that column is the release’s machine. The Halo runs the first layers of one chunk while the Mac runs the rest of the one before, so a helper slower than the Mac still adds its pace. oMLX cuts Flash-Next prompts into 4,096-token chunks.
 
 At 32,768 tokens the draft copies 49 of 49 eligible prompt tokens, and decode reads 163 tok/s. At 65,536 the Mac drafts new tokens at 66 tok/s.
 
@@ -70,13 +70,13 @@ The six families of the CUDA helper, at the same contract version.
 | Family | `model_type` | On the Radeon |
 | --- | --- | --- |
 | Qwen3.8 27B | `qwen3_5` | Measured. HIP kernels. |
-| Qwen3.8 Flash-Next | `qwen4_exp` | Fixture. HIP recurrence, plain ops for the rest. |
+| Qwen3.8 Flash-Next | `qwen4_exp` | Paired prefill measured. HIP kernels. |
 | MiniMax M3 / M3.1 | `minimax_m3_vl` | Fixture. Plain ops. |
 | GLM-5.3 Flash | `glm5_next` | Fixture. Plain ops. |
 | DeepSeek V4.1 | `deepseek_v41` | Fixture. Plain ops. |
 | Inkling 2 Small | `inkling2` | Fixture. Plain ops. |
 
-Fixture: the stage replays oMLX's contract fixture for that family on gfx1151 and matches the Mac's recorded output. No full checkpoint of those five has run here yet.
+Fixture: the stage replays oMLX's contract fixture for that family on gfx1151 and matches the Mac's recorded output. No full checkpoint of MiniMax, GLM-5.3, DeepSeek V4.1, or Inkling has run here yet.
 
 The CUDA helper's kernels for those families are tensor-core code and stay off. oQh checkpoints stay on the Mac. This MLX build has no 3-bit expert product, so a checkpoint with 3-bit experts does not run on the Halo yet.
 
