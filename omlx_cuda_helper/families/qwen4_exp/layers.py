@@ -99,6 +99,9 @@ class HyperConnection:
     def enable_kernels(self) -> None:
         """Take the square sums kernel, then the fused norm and mix kernels
         if they reproduce the block input and the write gates."""
+        if not kernels.available():
+            self.enable_hip()
+            return
         dtype = self.down.weight.dtype
         self.square_sums = checked_square_sums(self.scale, self.eps, dtype)
         if self.square_sums is None or not kernels.hc_fits(
@@ -211,6 +214,9 @@ class GatedDeltaNet:
 
     def enable_kernels(self) -> None:
         """Take the conv and recurrence kernels that match their references."""
+        if not kernels.available():
+            self.enable_hip()
+            return
         dtype = self.qkv.weight.dtype
         self.conv = checked_conv(self.taps, 1, dtype) or self.conv
         # Three staged step blocks, the last one partial, from a nonzero state.
@@ -388,6 +394,8 @@ class PLE:
         return own + self.key.parameters() + self.value.parameters()
 
     def enable_kernels(self) -> None:
+        if not kernels.available():
+            return
         dtype = self.key.weight.dtype
         self.conv = checked_conv(self.taps, self.dilation, dtype) or self.conv
         self.square_sums = checked_square_sums(self.key_scale, self.eps, dtype)
@@ -524,6 +532,9 @@ class MoE:
     def enable_kernels(self) -> None:
         """Use the combine kernel if it adds expert rows like ``stacked_sum``
         and the row gather and SwiGLU kernels if they equal their ops."""
+        if not kernels.available():
+            self.enable_hip()
+            return
         k, dtype = self.top_k, self.router.weight.dtype
         y = mx.random.normal((64 * k, 1, self.router.weight.shape[1])).astype(dtype)
         positions = mx.argsort(mx.random.uniform(shape=(64 * k,)))
@@ -596,6 +607,8 @@ class MoE:
         if kernels.close(got, want, "Expert"):
             self.gate_up = self.down = None
             mx.clear_cache()
+            # The CUDA helper reports this flag once its expert kernel is in.
+            self.expert_kernel = True
         else:
             self.hip_banks = None
 

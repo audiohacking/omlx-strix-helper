@@ -21,7 +21,6 @@ from ...wire import HostArray
 from . import (
     FIRST_STAGE_MIN,
     check_first_stage,
-    kernels,
     layer_kinds,
     ple_layers,
     resident,
@@ -114,10 +113,7 @@ class Stage:
     def add_layer(self) -> None:
         """Load the layer after the last one held, as the stage loaded it."""
         layer = self._load_layer(self.last)
-        if kernels.available():
-            layer.enable_kernels()
-        else:
-            layer.enable_hip()
+        layer.enable_kernels()
         self.layers.append(layer)
         self.last += 1
 
@@ -174,13 +170,13 @@ class Stage:
         return h, state
 
     def enable_kernels(self) -> None:
-        """Take the CUDA kernels whose results match the plain-ops reference."""
-        if kernels.available():
-            for layer in self.layers:
-                layer.enable_kernels()
-        else:
-            for layer in self.layers:
-                layer.enable_hip()
+        """Take the kernels whose results match the plain-ops reference.
+
+        On this build those are the HIP kernels. ``kernels.available`` is the
+        CUDA sources, which this ROCm build does not compile.
+        """
+        for layer in self.layers:
+            layer.enable_kernels()
 
     def warm(self, tokens: int) -> float:
         self.enable_kernels()

@@ -129,6 +129,9 @@ class Attention:
 
     def enable_kernels(self) -> None:
         """Use the prep, selection and attention kernels that reproduce the ops."""
+        if not kernels.available():
+            self.enable_hip()
+            return
         dtype = self.q_proj.weight.dtype
         geometry = (self.heads, self.kv_heads, self.head_dim, self.index_heads)
         half = self.inv_freq.shape[0]

@@ -30,6 +30,8 @@ logger = logging.getLogger("omlx_cuda_helper.worker")
 
 # Chunks a stage may run ahead of the acknowledgements of the next one.
 WINDOW = 2
+# Log each chunk's wait and compute seconds (set STRIX_CHUNK_LOG=1).
+_CHUNK_LOG = os.environ.get("STRIX_CHUNK_LOG", "") not in ("", "0")
 _UPSTREAM_TIMEOUT_S = 120.0
 # Shorter than the 10 s a host waits to connect: a silent peer that came
 # first must not use up that wait.
@@ -429,6 +431,7 @@ class StageServer:
             )
         start, use, rise, ahead = 0, self._opening, 0, 0
         for index, size in enumerate(job.chunks):
+            waited = time.perf_counter()
             with session.changed:
                 while (
                     index - job.acked > WINDOW or (job.feed and index not in job.inputs)
@@ -487,6 +490,11 @@ class StageServer:
                 if index == 0:
                     self._opening = use
             elapsed = time.perf_counter() - began
+            if _CHUNK_LOG:
+                logger.info(
+                    "job %s chunk %d: %d rows, %d layers, waited %.3f s, ran %.3f s",
+                    job.job_id, index, size, own, began - waited, elapsed,
+                )
             arrays.update({f"b:{n}": v for n, v in (boundary or {}).items()})
             reply = {
                 "op": "chunk",

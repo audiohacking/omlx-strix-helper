@@ -87,13 +87,17 @@ __device__ __forceinline__ v16s fn_codes(const unsigned* p) {
   union { v16s f; unsigned u[8]; } c;
 #pragma unroll
   for (int word = 0; word < 2; ++word) {
+    // Each nibble in a byte of its own, so a code converts in one
+    // v_cvt_f32_ubyte, and one permute packs the bf16 halves of two floats
+    // (small integers, exact either way).
     const unsigned x = p[word];
+    const unsigned lo = x & 0x0f0f0f0fu, hi = (x >> 4) & 0x0f0f0f0fu;
 #pragma unroll
     for (int d = 0; d < 4; ++d) {
-      const float low = (float)((x >> (8 * d)) & 15u);
-      const float high = (float)((x >> (8 * d + 4)) & 15u);
-      c.u[4 * word + d] = (__builtin_bit_cast(unsigned, low) >> 16) |
-                          (__builtin_bit_cast(unsigned, high) & 0xffff0000u);
+      const float low = (float)((lo >> (8 * d)) & 0xffu);
+      const float high = (float)((hi >> (8 * d)) & 0xffu);
+      c.u[4 * word + d] = __builtin_amdgcn_perm(
+          __builtin_bit_cast(unsigned, high), __builtin_bit_cast(unsigned, low), 0x07060302u);
     }
   }
   return c.f;
