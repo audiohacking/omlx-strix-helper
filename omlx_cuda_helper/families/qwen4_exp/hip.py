@@ -134,22 +134,29 @@ def available() -> bool:
     return _AVAILABLE
 
 
-# Attention of one (query row, KV head) a wave over the row's QSA blocks.
+# Attention of one (query row, KV head) over the row's QSA blocks.
 #
+# Four waves split the head dimension, so each keeps a short accumulator and
+# the four slices of a score sum in LDS before the softmax. One wave holding
+# the whole head was register-bound and ran about 3x slower on gfx1151.
 # Scores are taken transposed, keys as rows and the group's query heads as
-# columns, so both operands are rows of memory as stored. One exchange of the
-# wave's halves then leaves a lane with the 16 scores of its head, and the
-# softmax of a tile stays inside the lane. Each weight enters the value
-# product as two bf16 parts, its rounding and the remainder, so that product
-# keeps float32 precision. Values are read from a copy held as
-# [block][dim][key of the block], the operand of that product as stored.
+# columns. One exchange of a wave's halves then leaves a lane with the 16
+# scores of its head. Each weight enters the value product as two bf16 parts,
+# its rounding and the remainder. Values are read from a copy held as
+# [block][dim][key of the block].
 #
 # q [KV * G, rows, D], k [KV, keys, D], vt [KV, blocks, D, RATIO] bf16,
 # sel [rows, TOPK] int32 in key order, first int32 [1]: keys row 0 sees.
-# out [rows, KV * G, D] bf16.
+# out [rows, KV * G, D] bf16. Two waves split the head. Four waves synced
+# once per 16 keys and ran slower; one wave spilled and was slower too.
 _QSA = r"""
 constexpr int NT = D / 16;
-const int lane = threadIdx.x, sub = lane & 15, half = lane >> 4;
+constexpr int NW = 2;
+constexpr int SL = NT / NW;
+__shared__ float ps[NW][32][8];
+
+const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+const int sub = lane & 15, half = lane >> 4;
 const int R = q_shape[1];
 const int row = blockIdx.x / KV, kvh = blockIdx.x % KV;
 if (row >= R) return;
@@ -162,11 +169,12 @@ const int* picks = sel + size_t(row) * TOPK;
 const hip_bfloat16* kh = k + size_t(kvh) * k_shape[1] * D;
 const hip_bfloat16* vh = vt + size_t(kvh) * vt_shape[1] * D * RATIO;
 const hip_bfloat16* qh = q + (size_t(kvh * G + (sub < G ? sub : 0)) * R + row) * D;
+const int ks0 = wave * SL;
 
 float m = -FN_INF, l = 0.0f;
-v8f o[NT];
+v8f o[SL];
 #pragma unroll
-for (int n = 0; n < NT; ++n) o[n] = (v8f){};
+for (int n = 0; n < SL; ++n) o[n] = (v8f){};
 
 for (int b0 = 0; b0 < nblk; b0 += 16 / RATIO) {
   const int j = b0 + sub / RATIO;
@@ -177,8 +185,16 @@ for (int b0 = 0; b0 < nblk; b0 += 16 / RATIO) {
 
   v8f s = (v8f){};
 #pragma unroll
-  for (int ks = 0; ks < NT; ++ks)
-    s = fn_wmma(fn_load16(kp + ks * 16), fn_load16(qh + ks * 16), s);
+  for (int n = 0; n < SL; ++n)
+    s = fn_wmma(fn_load16(kp + (ks0 + n) * 16), fn_load16(qh + (ks0 + n) * 16), s);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) ps[wave][lane][i] = s[i];
+  __syncthreads();
+  s = (v8f){};
+#pragma unroll
+  for (int w = 0; w < NW; ++w)
+#pragma unroll
+    for (int i = 0; i < 8; ++i) s[i] += ps[w][lane][i];
 
   // Element i is key 2 i + half of this lane's head: take the other half's.
   float sc[16];
@@ -224,7 +240,7 @@ for (int b0 = 0; b0 < nblk; b0 += 16 / RATIO) {
     for (int i = 0; i < 8; ++i) {
       const float f = half ? scale[2 * i + 1] : scale[2 * i];
 #pragma unroll
-      for (int n = 0; n < NT; ++n) o[n][i] *= f;
+      for (int n = 0; n < SL; ++n) o[n][i] *= f;
     }
   }
 
@@ -233,15 +249,16 @@ for (int b0 = 0; b0 < nblk; b0 += 16 / RATIO) {
   for (int t = 0; t < 16 / RATIO; ++t)
     blocks[t] = __builtin_amdgcn_readlane(blk, t * RATIO);
 #pragma unroll
-  for (int n = 0; n < NT; ++n) {
+  for (int n = 0; n < SL; ++n) {
     union { v16s f; v2u u[4]; } vf;
 #pragma unroll
     for (int t = 0; t < 16 / RATIO; ++t)
       vf.u[t] = *reinterpret_cast<const v2u_any*>(
-          vh + (size_t(blocks[t]) * D + n * 16 + sub) * RATIO);
+          vh + (size_t(blocks[t]) * D + (ks0 + n) * 16 + sub) * RATIO);
     o[n] = fn_wmma(ph, vf.f, o[n]);
     o[n] = fn_wmma(pl, vf.f, o[n]);
   }
+  __syncthreads();
 }
 
 float total[16];
@@ -254,7 +271,221 @@ for (int i = 0; i < 8; ++i) {
   const float inv = half ? total[2 * i + 1] : total[2 * i];
   hip_bfloat16* y = out + (size_t(row) * KV * G + kvh * G + head) * D + sub;
 #pragma unroll
-  for (int n = 0; n < NT; ++n) y[n * 16] = hip_bfloat16(o[n][i] / inv);
+  for (int n = 0; n < SL; ++n) y[(ks0 + n) * 16] = hip_bfloat16(o[n][i] / inv);
+}
+"""
+
+# TR consecutive query rows attend the union of their selected blocks.
+# One 16-token chunk is loaded once and scored against every row; a key a row
+# did not select, or that is past that row's causal tail, scores as -inf.
+# The running output stays in registers, which fits two rows and not four.
+_QSA_UNION = r"""
+constexpr int NT = D / 16;
+constexpr int NW = 4;
+constexpr int SL = NT / NW;
+constexpr int TR = 2;
+__shared__ float ps[NW][32][8];
+__shared__ int ub[1024];
+__shared__ unsigned um[1024];
+__shared__ int meta[1 + 2 * TR];
+
+const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+const int sub = lane & 15, half = lane >> 4;
+const int R = q_shape[1];
+const int group = blockIdx.x / KV, kvh = blockIdx.x % KV;
+const int row0 = group * TR;
+if (row0 >= R) return;
+const hip_bfloat16* kh = k + size_t(kvh) * k_shape[1] * D;
+const hip_bfloat16* vh = vt + size_t(kvh) * vt_shape[1] * D * RATIO;
+const int ks0 = wave * SL;
+
+if (threadIdx.x == 0) {
+  int ptr[TR], cnt[TR], comp[TR], tail[TR];
+#pragma unroll
+  for (int q = 0; q < TR; ++q) {
+    ptr[q] = 0;
+    const int row = row0 + q;
+    if (row >= R) {
+      cnt[q] = 0;
+      comp[q] = 0;
+      tail[q] = 0;
+      continue;
+    }
+    const int vis = first[0] + row;
+    comp[q] = vis / RATIO;
+    tail[q] = vis - comp[q] * RATIO;
+    cnt[q] = comp[q] < TOPK ? comp[q] : TOPK;
+  }
+  int n = 0;
+  while (n < 1024) {
+    int best = 0x7fffffff;
+#pragma unroll
+    for (int q = 0; q < TR; ++q) {
+      if (ptr[q] >= cnt[q]) continue;
+      const int b = sel[(size_t(row0 + q) * TOPK) + ptr[q]];
+      if (b < best) best = b;
+    }
+    if (best == 0x7fffffff) break;
+    unsigned mask = 0;
+#pragma unroll
+    for (int q = 0; q < TR; ++q) {
+      if (ptr[q] >= cnt[q]) continue;
+      if (sel[(size_t(row0 + q) * TOPK) + ptr[q]] != best) continue;
+      mask |= 1u << q;
+      ptr[q]++;
+    }
+    ub[n] = best;
+    um[n] = mask;
+    n++;
+  }
+#pragma unroll
+  for (int q = 0; q < TR; ++q) {
+    if (tail[q] <= 0 || row0 + q >= R) continue;
+    int found = -1;
+    for (int i = 0; i < n; ++i)
+      if (ub[i] == comp[q]) found = i;
+    if (found < 0 && n < 1024) {
+      ub[n] = comp[q];
+      um[n] = 0;
+      found = n++;
+    }
+    if (found >= 0) um[found] |= 1u << q;
+  }
+  meta[0] = n;
+#pragma unroll
+  for (int q = 0; q < TR; ++q) {
+    meta[1 + q] = comp[q];
+    meta[1 + TR + q] = tail[q];
+  }
+}
+__syncthreads();
+const int nblk = meta[0];
+
+float m[TR], l[TR];
+v8f o[TR][SL];
+#pragma unroll
+for (int q = 0; q < TR; ++q) {
+  m[q] = -FN_INF;
+  l[q] = 0.0f;
+#pragma unroll
+  for (int n = 0; n < SL; ++n) o[q][n] = (v8f){};
+}
+
+for (int b0 = 0; b0 < nblk; b0 += 16 / RATIO) {
+  const int j = b0 + sub / RATIO;
+  int blk = 0;
+  unsigned mask = 0;
+  if (j < nblk) {
+    blk = ub[j];
+    mask = um[j];
+  }
+  const hip_bfloat16* kp = kh + (size_t(blk) * RATIO + sub % RATIO) * D;
+  v16s akey[SL];
+#pragma unroll
+  for (int n = 0; n < SL; ++n) akey[n] = fn_load16(kp + (ks0 + n) * 16);
+  int blocks[16 / RATIO];
+#pragma unroll
+  for (int t = 0; t < 16 / RATIO; ++t)
+    blocks[t] = __builtin_amdgcn_readlane(blk, t * RATIO);
+  union { v16s f; v2u u[4]; } aval[SL];
+#pragma unroll
+  for (int n = 0; n < SL; ++n) {
+#pragma unroll
+    for (int t = 0; t < 16 / RATIO; ++t)
+      aval[n].u[t] = *reinterpret_cast<const v2u_any*>(
+          vh + (size_t(blocks[t]) * D + (ks0 + n) * 16 + sub) * RATIO);
+  }
+
+#pragma unroll 1
+  for (int qi = 0; qi < TR; ++qi) {
+    const int row = row0 + qi;
+    const hip_bfloat16* qh =
+        q + (size_t(kvh * G + (sub < G ? sub : 0)) * R + (row < R ? row : row0)) * D;
+    v8f s = (v8f){};
+#pragma unroll
+    for (int n = 0; n < SL; ++n)
+      s = fn_wmma(akey[n], fn_load16(qh + (ks0 + n) * 16), s);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) ps[wave][lane][i] = s[i];
+    __syncthreads();
+    s = (v8f){};
+#pragma unroll
+    for (int w = 0; w < NW; ++w)
+#pragma unroll
+      for (int i = 0; i < 8; ++i) s[i] += ps[w][lane][i];
+    float sc[16];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float other = __shfl_xor(s[i], 16);
+      sc[2 * i] = half ? other : s[i];
+      sc[2 * i + 1] = half ? s[i] : other;
+    }
+    float tile_max = -FN_INF;
+#pragma unroll
+    for (int e = 0; e < 16; ++e) {
+      const int at = b0 + e / RATIO;
+      const unsigned bit = at < nblk ? um[at] : 0u;
+      const int b = at < nblk ? ub[at] : -1;
+      const bool mine = (bit >> qi) & 1u;
+      const bool tail_ok = b != meta[1 + qi] || (e % RATIO) < meta[1 + TR + qi];
+      const bool valid = row < R && mine && tail_ok;
+      sc[e] = valid ? sc[e] * INV_SQRT_D : -FN_INF;
+      tile_max = fmaxf(tile_max, sc[e]);
+    }
+    const float next = fmaxf(m[qi], tile_max);
+    const float alpha = m[qi] == -FN_INF ? 0.0f : expf(m[qi] - next);
+    float sum = 0.0f;
+    v16s ph, pl;
+#pragma unroll
+    for (int e = 0; e < 16; ++e) {
+      const float p = sc[e] == -FN_INF ? 0.0f : expf(sc[e] - next);
+      sum += p;
+      const unsigned high = fn_bf16(p);
+      ph[e] = (short)high;
+      pl[e] = (short)fn_bf16(p - fn_float(high));
+    }
+    l[qi] = l[qi] * alpha + sum;
+    m[qi] = next;
+    bool moved = false;
+    float scale[16];
+#pragma unroll
+    for (int h = 0; h < 16; ++h) {
+      scale[h] = h < G ? fn_lane(alpha, h) : 1.0f;
+      moved = moved || scale[h] != 1.0f;
+    }
+    if (moved) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const float f = half ? scale[2 * i + 1] : scale[2 * i];
+#pragma unroll
+        for (int n = 0; n < SL; ++n) o[qi][n][i] *= f;
+      }
+    }
+#pragma unroll
+    for (int n = 0; n < SL; ++n) {
+      o[qi][n] = fn_wmma(ph, aval[n].f, o[qi][n]);
+      o[qi][n] = fn_wmma(pl, aval[n].f, o[qi][n]);
+    }
+    __syncthreads();
+  }
+}
+
+#pragma unroll 1
+for (int q = 0; q < TR; ++q) {
+  const int row = row0 + q;
+  if (row >= R) continue;
+  float total[16];
+#pragma unroll
+  for (int h = 0; h < 16; ++h) total[h] = h < G ? fn_lane(l[q], h) : 1.0f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int head = 2 * i + half;
+    if (head >= G) continue;
+    const float inv = half ? total[2 * i + 1] : total[2 * i];
+    hip_bfloat16* y = out + (size_t(row) * KV * G + kvh * G + head) * D + sub;
+#pragma unroll
+    for (int n = 0; n < SL; ++n) y[(ks0 + n) * 16] = hip_bfloat16(o[q][n][i] / inv);
+  }
 }
 """
 
@@ -262,8 +493,9 @@ for (int i = 0; i < 8; ++i) {
 class SparseAttention:
     """Attention of contiguous query rows over their QSA-selected keys."""
 
-    # Query rows of one launch; bounds the selection the caller builds for it.
-    rows_per_launch = 2048
+    # Query rows of one launch. An 8192-row prompt is one tile, and the rows
+    # past the dense prefix stay in that launch instead of four passes.
+    rows_per_launch = 8192
 
     @staticmethod
     def fits(heads: int, kv_heads: int, dim: int, ratio: int, dtype: mx.Dtype) -> bool:
@@ -271,7 +503,7 @@ class SparseAttention:
             dtype == mx.bfloat16
             and heads % kv_heads == 0
             and heads // kv_heads <= 16
-            and dim % 16 == 0
+            and dim % 64 == 0
             and dim <= 256
             and ratio == 4
         )
@@ -291,6 +523,7 @@ class SparseAttention:
             output_names=["out"],
             source=_QSA.replace("INV_SQRT_D", f"{float(dim) ** -0.5!r}f"),
             header=_HEADER,
+            shared_memory=2 * 32 * 8 * 4 + 256,
         )
 
     def by_block(self, values: mx.array) -> mx.array:
@@ -334,8 +567,35 @@ class SparseAttention:
         out = self.kernel(
             inputs=[queries[0], keys[0], by_block, selected, first],
             template=self.template,
-            grid=(rows * self.kv_heads * 32, 1, 1),
-            threadgroup=(32, 1, 1),
+            grid=(rows * self.kv_heads * 64, 1, 1),
+            threadgroup=(64, 1, 1),
+            output_shapes=[(rows, self.heads, self.dim)],
+            output_dtypes=[queries.dtype],
+        )[0]
+        return out[None]
+
+    def union(self, queries, keys, values, selected, first_visible, by_block=None):
+        """The same attention, two query rows at a time over the union of their blocks."""
+        kernel = getattr(self, "_union", None)
+        if kernel is None:
+            kernel = mx.fast.cuda_kernel(
+                name=f"qwen4_hip_qsa_union_{self.heads}_{self.kv_heads}_{self.dim}",
+                input_names=["q", "k", "vt", "sel", "first"],
+                output_names=["out"],
+                source=_QSA_UNION.replace("INV_SQRT_D", f"{float(self.dim) ** -0.5!r}f"),
+                header=_HEADER,
+            )
+            self._union = kernel
+        rows = queries.shape[2]
+        if by_block is None:
+            by_block = self.by_block(values[0])
+        first = mx.array([first_visible], dtype=mx.int32)
+        groups = -(-rows // 2)
+        out = kernel(
+            inputs=[queries[0], keys[0], by_block, selected, first],
+            template=self.template,
+            grid=(groups * self.kv_heads * 128, 1, 1),
+            threadgroup=(128, 1, 1),
             output_shapes=[(rows, self.heads, self.dim)],
             output_dtypes=[queries.dtype],
         )[0]
@@ -344,6 +604,21 @@ class SparseAttention:
 
 # Rows through 4-bit experts, a wave an (expert, block of output columns).
 #
+# A group of 64 inputs shares one scale and bias, so its part of a sum is
+# scale * sum(x * code) + bias * sum(x). The codes are small integers, exact
+# as bf16, and the first sum is a WMMA product of the rows as stored and the
+# codes; the scale, the bias and the total are float32. A wave takes TM tiles
+# of 16 routes at a time against TN tiles of 16 columns.
+#
+# The bank is held as a wave reads it (see ``expert_bank``): the codes of a
+# column tile step by step, its scales and biases group by group.
+#
+# x [rows, K] bf16, xs [rows, K / 64] float32 sums of each group of x,
+# w [E, N / 16, K / 16, 16, 2] uint32, sb [E, N / 16, K / 64, 16, 2] bf16
+# (scale, bias), offsets [E + 1] int32, src [routes] uint32 (GATHER: route r
+# reads row src[r]). y [routes, N] bf16,
+# or with ACT [routes, N / 2] of silu(first half) * second half, each step
+# rounded to bf16 as the ops round it.
 # A group of 64 inputs shares one scale and bias, so its part of a sum is
 # scale * sum(x * code) + bias * sum(x). The codes are small integers, exact
 # as bf16, and the first sum is a WMMA product of the rows as stored and the
@@ -471,6 +746,149 @@ for (int r0 = begin; r0 < end; r0 += 16 * TM) {
 #undef FN_TILE
 """
 
+# One wave, one 16-row tile, two output groups. The activation group sum is
+# reduced in the wave while the fragments are loaded, so the host sum is gone.
+# A lane holds its own row; the other half of the wave repeats it.
+_EXPERTS_TIGHT_GATE = r"""
+__shared__ float rowsum[16];
+constexpr int GROUPS = K / 64;
+constexpr int W = N / 2;
+constexpr int NG = 2;
+const int sub = threadIdx.x & 15, half = threadIdx.x >> 4;
+const int og0 = blockIdx.y * NG;
+const int e = blockIdx.z;
+const int begin = offsets[e], end = offsets[e + 1];
+const int r0 = begin + blockIdx.x * 16;
+if (og0 >= W / 16 || r0 >= end) return;
+const int row = r0 + sub;
+const int live = row < end ? row : end - 1;
+const int id = GATHER ? (int)src[live] : live;
+v8f acc0[NG], acc1[NG];
+const unsigned* wg[NG];
+const unsigned* wu[NG];
+#pragma unroll
+for (int ogi = 0; ogi < NG; ++ogi) {
+  acc0[ogi] = {};
+  acc1[ogi] = {};
+  const int og = og0 + ogi;
+  wg[ogi] = w + ((size_t(e) * (N / 16) + og) * (K / 16)) * 32 + sub * 2;
+  wu[ogi] = w + ((size_t(e) * (N / 16) + (W / 16 + og)) * (K / 16)) * 32 + sub * 2;
+}
+const hip_bfloat16* xp = x + (size_t)id * K;
+for (int g = 0; g < GROUPS; ++g) {
+  v16s a[4];
+  float mine = 0.0f;
+#pragma unroll
+  for (int ks = 0; ks < 4; ++ks) {
+    const hip_bfloat16* ap = xp + g * 64 + ks * 16;
+    a[ks] = fn_load16(ap);
+    float lo[8], hi[8];
+    fn_load8(ap, lo);
+    fn_load8(ap + 8, hi);
+#pragma unroll
+    for (int d = 0; d < 8; ++d) mine += lo[d] + hi[d];
+  }
+  if (half == 0) rowsum[sub] = mine;
+  __syncthreads();
+  float gsum[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) gsum[i] = rowsum[2 * i + half];
+#pragma unroll
+  for (int ogi = 0; ogi < NG; ++ogi) {
+    v8f p0 = {}, p1 = {};
+#pragma unroll
+    for (int ks = 0; ks < 4; ++ks) {
+      p0 = fn_wmma(a[ks], fn_codes(wg[ogi] + (g * 4 + ks) * 32), p0);
+      p1 = fn_wmma(a[ks], fn_codes(wu[ogi] + (g * 4 + ks) * 32), p1);
+    }
+    const int og = og0 + ogi;
+    const unsigned bg = *reinterpret_cast<const unsigned*>(
+        sb + ((size_t(e) * (N / 16) + og) * GROUPS + g) * 32 + sub * 2);
+    const unsigned bu = *reinterpret_cast<const unsigned*>(
+        sb + ((size_t(e) * (N / 16) + W / 16 + og) * GROUPS + g) * 32 + sub * 2);
+    const float s0 = fn_float(bg & 0xffffu), b0 = fn_float(bg >> 16);
+    const float s1 = fn_float(bu & 0xffffu), b1 = fn_float(bu >> 16);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      acc0[ogi][i] += s0 * p0[i] + b0 * gsum[i];
+      acc1[ogi][i] += s1 * p1[i] + b1 * gsum[i];
+    }
+  }
+}
+#pragma unroll
+for (int ogi = 0; ogi < NG; ++ogi) {
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int r = r0 + 2 * i + half;
+    if (r >= end) continue;
+    const float gate = fn_float(fn_bf16(acc0[ogi][i]));
+    const float sig = fn_float(fn_bf16(1.0f / (1.0f + expf(-gate))));
+    const float silu = fn_float(fn_bf16(gate * sig));
+    const float v = silu * fn_float(fn_bf16(acc1[ogi][i]));
+    reinterpret_cast<unsigned short*>(y)[(size_t)r * W + (og0 + ogi) * 16 + sub] =
+        (unsigned short)fn_bf16(v);
+  }
+}
+"""
+
+# Down projection: one wave, four output groups, the short K streamed once.
+_EXPERTS_TIGHT_DOWN = r"""
+constexpr int GROUPS = K / 64;
+constexpr int NG = 4;
+const int sub = threadIdx.x & 15, half = threadIdx.x >> 4;
+const int og0 = blockIdx.y * NG;
+const int e = blockIdx.z;
+const int begin = offsets[e], end = offsets[e + 1];
+const int r0 = begin + blockIdx.x * 16;
+if (og0 >= N / 16 || r0 >= end) return;
+const int row = r0 + sub;
+const int live = row < end ? row : end - 1;
+const int id = GATHER ? (int)src[live] : live;
+int rsel[8];
+#pragma unroll
+for (int i = 0; i < 8; ++i) {
+  const int even = __builtin_amdgcn_readlane(id, 2 * i);
+  const int odd = __builtin_amdgcn_readlane(id, 2 * i + 1);
+  rsel[i] = half ? odd : even;
+}
+v8f acc[NG];
+const unsigned* wc[NG];
+#pragma unroll
+for (int ogi = 0; ogi < NG; ++ogi) {
+  acc[ogi] = {};
+  wc[ogi] = w + ((size_t(e) * (N / 16) + og0 + ogi) * (K / 16)) * 32 + sub * 2;
+}
+const hip_bfloat16* xp = x + (size_t)id * K;
+for (int g = 0; g < GROUPS; ++g) {
+  v16s a[4];
+#pragma unroll
+  for (int ks = 0; ks < 4; ++ks) a[ks] = fn_load16(xp + g * 64 + ks * 16);
+#pragma unroll
+  for (int ogi = 0; ogi < NG; ++ogi) {
+    v8f p = {};
+#pragma unroll
+    for (int ks = 0; ks < 4; ++ks)
+      p = fn_wmma(a[ks], fn_codes(wc[ogi] + (g * 4 + ks) * 32), p);
+    const unsigned both = *reinterpret_cast<const unsigned*>(
+        sb + ((size_t(e) * (N / 16) + og0 + ogi) * GROUPS + g) * 32 + sub * 2);
+    const float scale = fn_float(both & 0xffffu), bias = fn_float(both >> 16);
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      acc[ogi][i] += scale * p[i] + bias * xs[(size_t)rsel[i] * GROUPS + g];
+  }
+}
+#pragma unroll
+for (int ogi = 0; ogi < NG; ++ogi) {
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int r = r0 + 2 * i + half;
+    if (r >= end) continue;
+    reinterpret_cast<unsigned short*>(y)[(size_t)r * N + (og0 + ogi) * 16 + sub] =
+        (unsigned short)fn_bf16(acc[ogi][i]);
+  }
+}
+"""
+
 # Route tiles and column tiles of a wave: the fastest that keeps its sums in
 # registers.
 _EXPERT_TILES = (3, 2)
@@ -484,6 +902,8 @@ def expert_gemm_fits(bank: tuple, width: int, act: bool = False) -> bool:
         return False
     columns = weight.shape[1] // 2 if act else weight.shape[1]
     tiles = _EXPERT_TILES[1] // 2 if act else _EXPERT_TILES[1]
+    if tiles < 1:
+        return False
     return (
         quant.get("bits") == 4
         and quant.get("group_size") == 64
@@ -512,6 +932,67 @@ def expert_bank(bank: tuple) -> tuple[mx.array, mx.array]:
     return mx.contiguous(codes.transpose(order)), mx.contiguous(both.transpose(order))
 
 
+def _tight_tiles(offsets, routes: int) -> int:
+    """Row tiles of the fullest expert. Empty tiles of a shorter expert return."""
+    span = mx.max(offsets[1:] - offsets[:-1])
+    full = (int(span.item()) + 15) // 16
+    return max(1, min(full, (routes + 15) // 16))
+
+
+_TIGHT_GATE = None
+_TIGHT_DOWN = None
+
+
+def _expert_tight_gate(x, codes, both, offsets, src, inputs, width, count):
+    global _TIGHT_GATE
+    if _TIGHT_GATE is None:
+        _TIGHT_GATE = mx.fast.cuda_kernel(
+            name="qwen4_hip_experts_tight_gate",
+            input_names=["x", "w", "sb", "offsets", "src"],
+            output_names=["y"],
+            source=_EXPERTS_TIGHT_GATE,
+            header=_HEADER,
+            shared_memory=256,
+        )
+    routes = x.shape[0] if src is None else src.shape[0]
+    tiles = _tight_tiles(offsets, routes)
+    return _TIGHT_GATE(
+        inputs=[x, codes, both, offsets, offsets if src is None else src],
+        template=[("K", inputs), ("N", width), ("GATHER", int(src is not None))],
+        grid=(tiles * 32, (width // 2) // 32, count),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(routes, width // 2)],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
+
+
+
+def _expert_tight_down(x, codes, both, offsets, src, inputs, width, count):
+    global _TIGHT_DOWN
+    if _TIGHT_DOWN is None:
+        _TIGHT_DOWN = mx.fast.cuda_kernel(
+            name="qwen4_hip_experts_tight_down",
+            input_names=["x", "xs", "w", "sb", "offsets", "src"],
+            output_names=["y"],
+            source=_EXPERTS_TIGHT_DOWN,
+            header=_HEADER,
+        )
+    rows = x.shape[0]
+    routes = rows if src is None else src.shape[0]
+    sums = x.reshape(rows, inputs // 64, 64).astype(mx.float32).sum(axis=-1)
+    tiles = _tight_tiles(offsets, routes)
+    return _TIGHT_DOWN(
+        inputs=[x, sums, codes, both, offsets, offsets if src is None else src],
+        template=[("K", inputs), ("N", width), ("GATHER", int(src is not None))],
+        grid=(tiles * 32, width // 64, count),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(routes, width)],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
 def expert_gemm(
     x: mx.array,
     bank: tuple[mx.array, mx.array],
@@ -533,6 +1014,16 @@ def expert_gemm(
     rows, inputs = x.shape
     routes = rows if src is None else src.shape[0]
     tm, tn = tiles or _EXPERT_TILES
+    # One wave owns two gate groups, or four down groups. The older tile loop
+    # re-reads the activation once per column and loses to this on gfx1151.
+    if tiles is None and inputs % 64 == 0 and act and width % 32 == 0:
+        return _expert_tight_gate(
+            x, codes, both, offsets, src, inputs, width, count
+        )
+    if tiles is None and inputs % 64 == 0 and not act and width % 64 == 0:
+        return _expert_tight_down(
+            x, codes, both, offsets, src, inputs, width, count
+        )
     key = (tm, tn)
     kernel = _EXPERT_KERNELS.get(key)
     if kernel is None:

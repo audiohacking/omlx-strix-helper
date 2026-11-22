@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 from typing import Any
 
 import mlx.core as mx
@@ -97,8 +98,15 @@ class Attention:
 
         self.index_heads = text.get("indexer_n_heads", 4)
         self.index_dim = text.get("indexer_head_dim", 128)
-        self.budget = text.get("indexer_budget", 2048)
         self.ratio = text.get("indexer_compress_ratio", 4)
+        # STRIX_QPF2K_QSA_BUDGET=1536 is the fast profile. On an 8,192-row
+        # forward it lengthens the sparse tail and the full model got slower,
+        # so the checkpoint budget stays unless that variable is set.
+        checkpoint = int(text.get("indexer_budget", 2048))
+        requested = os.environ.get("STRIX_QPF2K_QSA_BUDGET", "")
+        self.budget = int(requested) if requested[:1] not in ("", "0") else checkpoint
+        if self.budget % self.ratio:
+            raise ValueError(f"indexer budget {self.budget} is not a multiple of {self.ratio}")
         self.top_k = self.budget // self.ratio
         self.index_proj = w.linear("indexer.index_qk_proj")
         self.index_q_scale = unit_scale(w["indexer.q_layernorm.weight"])
@@ -183,13 +191,23 @@ class Attention:
         values = mx.random.normal(shape).astype(dtype)
         queries = mx.random.normal((1, self.heads, rows, self.head_dim)).astype(dtype)
         visible = total - rows + mx.arange(rows, dtype=mx.int32) + 1
+        complete = visible // self.ratio
         blocks = total // self.ratio
-        picks = mx.argsort(mx.random.uniform(shape=(rows, blocks)), axis=-1)
-        picks = mx.sort(picks[:, : self.top_k].astype(mx.int32), axis=-1)
-        first = mx.arange(self.top_k, dtype=mx.int32)[None]
-        selected = mx.where(
-            (visible // self.ratio <= self.top_k)[:, None], first, picks
+        # Only complete blocks, as the indexer does in production. Random
+        # picks that reach past ``complete`` are not a real selection and
+        # disagree with the shared-key kernel's filling-block mask.
+        scores = mx.random.uniform(shape=(rows, blocks))
+        scores = mx.where(
+            mx.arange(blocks)[None, :] < complete[:, None],
+            scores,
+            mx.zeros_like(scores) - 1,
         )
+        picks = mx.sort(
+            mx.argsort(scores, axis=-1)[:, -self.top_k :].astype(mx.int32),
+            axis=-1,
+        )
+        first = mx.arange(self.top_k, dtype=mx.int32)[None]
+        selected = mx.where((complete <= self.top_k)[:, None], first, picks)
         want = self._gathered(queries, keys, values, selected, visible)
         got = kernel(queries, keys, values, selected, total - rows + 1)
         return kernels.close(got, want, "QSA attention")
@@ -509,23 +527,29 @@ class Attention:
         token = mx.arange(total)[None]
         if rows >= GATHERED_MIN_QUERIES and total > self.budget:
             # Rows that see at most top_k complete blocks attend to all keys.
+            # The causal kernel is asked about this prefix only: the rows past
+            # it see more than top_k blocks, and asking about the whole tensor
+            # makes the kernel refuse the prefix too.
             dense = min(rows, max(0, self.budget + self.ratio - 1 - past))
             if rows - dense == 1:
                 dense -= 1
             outputs = []
             if dense:
-                causal = token[:, : past + dense] <= past + mx.arange(dense)[:, None]
-                outputs.append(
-                    self._masked(
+                head = self._hip_causal(queries[:, :, :dense], cache, past + 1)
+                if head is None:
+                    allow = token[:, : past + dense] <= past + mx.arange(dense)[:, None]
+                    head = self._masked(
                         queries[:, :, :dense],
                         cache.keys[:, :, : past + dense],
                         cache.values[:, :, : past + dense],
-                        causal,
+                        allow,
                     )
-                )
+                outputs.append(head)
             if dense < rows:
                 outputs.append(self._sparse_rows(queries, index_queries, cache, dense))
             output = outputs[0] if len(outputs) == 1 else mx.concatenate(outputs, 1)
+        elif (causal := self._hip_causal(queries, cache, past + 1)) is not None:
+            output = causal
         else:
             visible = past + mx.arange(rows, dtype=mx.int32) + 1
             if total // self.ratio > self.top_k:
@@ -535,3 +559,27 @@ class Attention:
                 mask = token < visible[:, None]
             output = self._masked(queries, cache.keys, cache.values, mask)
         return self.o_proj(output.reshape(1, rows, -1) * mx.sigmoid(gate))
+
+    def _hip_causal(self, queries: mx.array, cache: QSACache, first_visible: int):
+        """Causal attention through the HIP kernel when every row fits top_k blocks.
+
+        ``first_visible`` is the number of keys the first query row can see.
+        Returns None when a row sees more than ``top_k`` complete blocks.
+        """
+        kernel = self.kernel
+        if not isinstance(kernel, hip.SparseAttention):
+            return None
+        rows = queries.shape[2]
+        if (first_visible + rows - 1) // self.ratio > self.top_k:
+            return None
+        selected = mx.broadcast_to(
+            mx.arange(self.top_k, dtype=mx.int32)[None, :], (rows, self.top_k)
+        )
+        return kernel.union(
+            queries,
+            cache.keys,
+            cache.values,
+            mx.contiguous(selected),
+            first_visible,
+            kernel.blocked(cache),
+        )
