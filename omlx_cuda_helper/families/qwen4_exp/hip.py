@@ -1540,6 +1540,106 @@ for (int i = lane; i - lane < complete; i += 32) {
 """
 
 
+# The same selection with each row's scores read once. A group of NW waves
+# owns one row; wave w holds blocks [w * 32 * PER, (w + 1) * 32 * PER),
+# lane-interleaved, as keys in registers. The radix passes count from the
+# registers and add the waves' counts in LDS, and the take pass keeps block
+# order across the waves. The one-wave kernel above reads a row's scores
+# from memory in each of its thirteen passes: 9.3 against 2.6 ms for 4,096
+# rows at a 32K past.
+_TOP_BLOCKS_HELD = r"""
+__shared__ int part[32][8];
+const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+const int NW = blockDim.x >> 5;
+const int row = blockIdx.x;
+const int complete = (first[0] + row) / RATIO;
+int* out = sel + size_t(row) * TOPK;
+if (complete <= TOPK) {
+  for (int j = threadIdx.x; j < TOPK; j += blockDim.x) out[j] = j;
+  return;
+}
+const unsigned* sp =
+    reinterpret_cast<const unsigned*>(scores) + size_t(row) * scores_shape[1];
+const int base = wave * 32 * PER + lane;
+unsigned key[PER];
+#pragma unroll
+for (int j = 0; j < PER; ++j) {
+  const int i = base + 32 * j;
+  // A score as an ordered key above zero; zero past the complete blocks.
+  key[j] = i < complete ? (sp[i] & 0x7fffffffu) + 1u : 0u;
+}
+// Sum of one count over the group: each wave adds its lanes, then the waves.
+auto group_sum = [&](int* c, int n) {
+  for (int d = 0; d < n; ++d) {
+    const int w = fn_wave_count(c[d]);
+    if (lane == 0) part[wave][d] = w;
+  }
+  __syncthreads();
+  for (int d = 0; d < n; ++d) {
+    int s = 0;
+    for (int v = 0; v < NW; ++v) s += part[v][d];
+    c[d] = s;
+  }
+  __syncthreads();
+};
+unsigned edge = 0;
+for (int shift = 30; shift >= 0; shift -= 3) {
+  unsigned at[7];
+  int count[7];
+#pragma unroll
+  for (int d = 0; d < 7; ++d) {
+    // The top digit has two bits; a key never reaches the last value.
+    at[d] = shift == 30 && d >= 3 ? 0xffffffffu : edge + (unsigned(d + 1) << shift);
+    count[d] = 0;
+  }
+#pragma unroll
+  for (int j = 0; j < PER; ++j)
+#pragma unroll
+    for (int d = 0; d < 7; ++d) count[d] += key[j] >= at[d];
+  group_sum(count, 7);
+  int digit = 0;
+#pragma unroll
+  for (int d = 0; d < 7; ++d) digit += count[d] >= TOPK;
+  edge += unsigned(digit) << shift;
+}
+int tally[2] = {0, 0};
+#pragma unroll
+for (int j = 0; j < PER; ++j) {
+  tally[0] += key[j] > edge;
+  tally[1] += key[j] == edge;
+}
+// Waves before this one: their keys above the edge and their equal keys.
+{
+  const int a = fn_wave_count(tally[0]), e = fn_wave_count(tally[1]);
+  if (lane == 0) { part[wave][0] = a; part[wave][1] = e; }
+}
+__syncthreads();
+int above = 0, before_above = 0, before_equal = 0;
+for (int v = 0; v < NW; ++v) {
+  above += part[v][0];
+  if (v < wave) { before_above += part[v][0]; before_equal += part[v][1]; }
+}
+const int ties = TOPK - above;
+int tied = before_equal;
+int taken = before_above + (before_equal < ties ? before_equal : ties);
+const unsigned below = (1u << lane) - 1u;
+#pragma unroll
+for (int j = 0; j < PER; ++j) {
+  const int i = base + 32 * j;
+  const unsigned k = key[j];
+  const unsigned equal = fn_ballot(k == edge);
+  const bool take =
+      k > edge || (k == edge && tied + __builtin_popcount(equal & below) < ties);
+  const unsigned takes = fn_ballot(take);
+  if (take) out[taken + __builtin_popcount(takes & below)] = i;
+  taken += __builtin_popcount(takes);
+  tied += __builtin_popcount(equal);
+}
+"""
+# Scores a lane holds; a group takes up to 32 waves.
+_TOP_HELD = 64
+
+
 class BlockSelection:
     """Each query's ``top_k`` best blocks, in block order."""
 
@@ -1568,6 +1668,13 @@ class BlockSelection:
             source=_TOP_BLOCKS,
             header=_HEADER,
         )
+        self.held = mx.fast.cuda_kernel(
+            name=f"qwen4_hip_top_blocks_held_{ratio}_{top_k}",
+            input_names=["scores", "first"],
+            output_names=["sel"],
+            source=_TOP_BLOCKS_HELD,
+            header=_HEADER,
+        )
 
     def block_scores(self, index_queries: mx.array, pooled: mx.array) -> mx.array:
         """Float32 score [rows, blocks] of each block for each query."""
@@ -1589,12 +1696,23 @@ class BlockSelection:
 
         A row with at most ``top_k`` complete blocks gets the first ``top_k`` ids.
         """
-        rows = index_queries.shape[0]
+        rows, blocks = index_queries.shape[0], pooled.shape[1]
+        inputs = [
+            self.block_scores(index_queries, pooled),
+            mx.array([first_visible], dtype=mx.int32),
+        ]
+        waves = -(-blocks // (32 * _TOP_HELD))
+        if waves <= 32:
+            return self.held(
+                inputs=inputs,
+                template=[("RATIO", self.ratio), ("TOPK", self.top_k), ("PER", _TOP_HELD)],
+                grid=(rows * 32 * waves, 1, 1),
+                threadgroup=(32 * waves, 1, 1),
+                output_shapes=[(rows, self.top_k)],
+                output_dtypes=[mx.int32],
+            )[0]
         return self.top(
-            inputs=[
-                self.block_scores(index_queries, pooled),
-                mx.array([first_visible], dtype=mx.int32),
-            ],
+            inputs=inputs,
             template=[("RATIO", self.ratio), ("TOPK", self.top_k)],
             grid=(rows * 32, 1, 1),
             threadgroup=(32, 1, 1),
