@@ -494,6 +494,15 @@ for (int q = 0; q < TR; ++q) {
 """
 
 
+def _lead(x: mx.array) -> mx.array:
+    """``x[0]`` of a leading axis of one, as a view.
+
+    This ROCm build runs ``x[0]`` as a gather: 36 ms for the keys of a
+    61,440-row cache, against 0.04 ms for the squeeze.
+    """
+    return mx.squeeze(x, 0)
+
+
 class SparseAttention:
     """Attention of contiguous query rows over their QSA-selected keys."""
 
@@ -543,7 +552,7 @@ class SparseAttention:
     def blocked(self, cache) -> mx.array:
         """The values of a QSA cache by block, extended by the rows it gained."""
         have = 0 if cache.blocked is None else cache.blocked.shape[1]
-        full = self.by_block(cache.values[0, :, have * self.ratio :])
+        full = self.by_block(_lead(cache.values)[:, have * self.ratio :])
         if have:
             full = mx.concatenate([cache.blocked, full], axis=1)
         # A block that is still filling is laid out again next time.
@@ -566,10 +575,10 @@ class SparseAttention:
         """
         rows = queries.shape[2]
         if by_block is None:
-            by_block = self.by_block(values[0])
+            by_block = self.by_block(_lead(values))
         first = mx.array([first_visible], dtype=mx.int32)
         out = self.kernel(
-            inputs=[queries[0], keys[0], by_block, selected, first],
+            inputs=[_lead(queries), _lead(keys), by_block, selected, first],
             template=self.template,
             grid=(rows * self.kv_heads * 64, 1, 1),
             threadgroup=(64, 1, 1),
@@ -592,11 +601,11 @@ class SparseAttention:
             self._union = kernel
         rows = queries.shape[2]
         if by_block is None:
-            by_block = self.by_block(values[0])
+            by_block = self.by_block(_lead(values))
         first = mx.array([first_visible], dtype=mx.int32)
         groups = -(-rows // 2)
         out = kernel(
-            inputs=[queries[0], keys[0], by_block, selected, first],
+            inputs=[_lead(queries), _lead(keys), by_block, selected, first],
             template=self.template,
             grid=(groups * self.kv_heads * 128, 1, 1),
             threadgroup=(128, 1, 1),
@@ -1551,7 +1560,7 @@ class BlockSelection:
         rows, blocks = index_queries.shape[0], pooled.shape[1]
         per_wave = self.tiles * (16 // self.heads)
         return self.scores(
-            inputs=[index_queries, pooled[0]],
+            inputs=[index_queries, _lead(pooled)],
             template=[("H", self.heads), ("DIM", self.dim), ("TQ", self.tiles)],
             grid=(-(-rows // per_wave) * 32, 1, 1),
             threadgroup=(32, 1, 1),

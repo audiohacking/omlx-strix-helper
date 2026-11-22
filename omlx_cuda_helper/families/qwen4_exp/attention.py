@@ -326,7 +326,7 @@ class Attention:
             pooled = mx.mean(raw.astype(mx.float32), axis=-2).astype(raw.dtype)
             pooled = norm(pooled, self.index_k_scale, self.eps)
             # A block is rotated by the position of its first token.
-            starts = cache.positions[0, have * ratio : complete * ratio : ratio]
+            starts = mx.squeeze(cache.positions, 0)[have * ratio : complete * ratio : ratio]
             pooled = self._rope(pooled[:, None], starts)[:, 0]
             if cache.pooled is not None:
                 pooled = mx.concatenate([cache.pooled, pooled], axis=1)
@@ -341,7 +341,7 @@ class Attention:
         rows, blocks = index_queries.shape[0], pooled.shape[1]
         scores = index_queries.astype(mx.float32).reshape(
             rows * self.index_heads, self.index_dim
-        ) @ pooled[0].astype(mx.float32).swapaxes(-1, -2)
+        ) @ mx.squeeze(pooled, 0).astype(mx.float32).swapaxes(-1, -2)
         return self._head_sum(scores.reshape(rows, self.index_heads, blocks))
 
     def _select(
@@ -413,13 +413,13 @@ class Attention:
         flat = mx.where(valid, tokens, 0).reshape(-1)
 
         def gather(cached: mx.array) -> mx.array:
-            picked = cached[0].transpose(1, 0, 2)[flat]
+            picked = mx.squeeze(cached, 0).transpose(1, 0, 2)[flat]
             return picked.reshape(rows, -1, self.kv_heads, self.head_dim).transpose(
                 0, 2, 1, 3
             )
 
         grouped = (
-            queries[0]
+            mx.squeeze(queries, 0)
             .transpose(1, 0, 2)
             .reshape(rows, self.kv_heads, groups, self.head_dim)
         )
@@ -511,7 +511,7 @@ class Attention:
             self._rope(keys, positions),
             values,
             index[None, :, self.index_heads],
-            index_queries[0].swapaxes(0, 1),
+            mx.squeeze(index_queries, 0).swapaxes(0, 1),
         )
 
     def __call__(self, x: mx.array, cache: QSACache) -> mx.array:
