@@ -1,4 +1,4 @@
-# omlx strix worker
+# oMLX Strix/AMD Helper
 
 <img width="887" height="395" alt="omlxstrix" src="https://github.com/user-attachments/assets/5315dd92-b5ca-4dd1-a921-001e36028cbd" />
 
