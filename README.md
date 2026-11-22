@@ -21,10 +21,10 @@ Prefill tok/s on a 64K-token prompt with an M3 Ultra (512 GB), oQ4e checkpoints,
 
 | Model | M3 Ultra alone | + Strix Halo | + DGX Spark | + 2x RTX A6000 |
 | --- | ---: | ---: | ---: | ---: |
-| Qwen3.8 27B | 352 | 831 (+136%) | 1,062 (+202%) | 1,879 (+434%) |
-| Qwen3.8 Flash-Next | 1,370 | 2,160 (+97%\*) | 2,715 (+98%) | 3,928 (+187%) |
+| Qwen3.8 27B | 386 | 831 (+115%) | 1,062 (+202%) | 1,879 (+434%) |
+| Qwen3.8 Flash-Next | 1,095 | 2,160 (+97%) | 2,715 (+98%) | 3,928 (+187%) |
 
-* The M3 Ultra alone, DGX Spark, and RTX A6000 figures are from the [oMLX 0.8.0 release](https://github.com/jundot/omlx/releases/tag/v0.8.0), over 2.5 GbE. 
+* The DGX Spark and RTX A6000 figures and their increases are from the [oMLX 0.8.0 release](https://github.com/jundot/omlx/releases/tag/v0.8.0), over 2.5 GbE, where the M3 Ultra alone reads 352 (27B) and 1,370 (Flash-Next).
 * The Strix Halo figures are over Thunderbolt.
 
 M3 Ultra with one Strix Halo, 64 generated tokens, MTP on:
