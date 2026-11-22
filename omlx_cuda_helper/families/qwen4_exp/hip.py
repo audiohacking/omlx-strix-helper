@@ -174,23 +174,37 @@ const hip_bfloat16* kh = k + size_t(kvh) * k_shape[1] * D;
 const hip_bfloat16* vh = vt + size_t(kvh) * vt_shape[1] * D * RATIO;
 const hip_bfloat16* qh = q + (size_t(kvh * G + (sub < G ? sub : 0)) * R + row) * D;
 const int ks0 = wave * SL;
+// The wave's slice of the queries stays in registers for every key.
+v16s qr[SL];
+#pragma unroll
+for (int n = 0; n < SL; ++n) qr[n] = fn_load16(qh + (ks0 + n) * 16);
 
 float m = -FN_INF, l = 0.0f;
 v8f o[SL];
 #pragma unroll
 for (int n = 0; n < SL; ++n) o[n] = (v8f){};
 
+// The next step's block id loads while this step's keys do.
+int nextblk = 0;
+{
+  const int j = sub / RATIO;
+  if (j < count) nextblk = picks[j];
+  else if (j == count) nextblk = complete;
+}
 for (int b0 = 0; b0 < nblk; b0 += 16 / RATIO) {
-  const int j = b0 + sub / RATIO;
-  int blk = 0;
-  if (j < count) blk = picks[j];
-  else if (j == count) blk = complete;
+  const int blk = nextblk;
+  {
+    const int j = b0 + 16 / RATIO + sub / RATIO;
+    nextblk = 0;
+    if (j < count) nextblk = picks[j];
+    else if (j == count) nextblk = complete;
+  }
   const hip_bfloat16* kp = kh + (size_t(blk) * RATIO + sub % RATIO) * D;
 
   v8f s = (v8f){};
 #pragma unroll
   for (int n = 0; n < SL; ++n)
-    s = fn_wmma(fn_load16(kp + (ks0 + n) * 16), fn_load16(qh + (ks0 + n) * 16), s);
+    s = fn_wmma(fn_load16(kp + (ks0 + n) * 16), qr[n], s);
 #pragma unroll
   for (int i = 0; i < 8; ++i) ps[wave][lane][i] = s[i];
   __syncthreads();
