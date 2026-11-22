@@ -104,5 +104,5 @@ State lives in `~/.omlx-cuda-helper`. Pair from the Mac: Cluster, Find devices, 
 
 - **Prefill close to the Mac's own speed.** Check that the cable reads 10000 or 80000 Mbit/s in Check. A gigabit path, or a helper that dropped out, looks like this.
 - **First prompt after an update is slower.** With the layer count on Auto, oMLX first re-measures both sides; later prompts settle.
-- **Speed drops over long sessions.** The Halo's GPU clock comes down under sustained load. Balanced firmware keeps that drop small.
+- **Speed drops over long sessions.** Both machines lower their GPU clocks under sustained load. After ten minutes or more of continuous long prompts, the Mac's own prefill can run about a fifth slower until it has cooled for a few minutes; Balanced firmware keeps the Halo's drop small. Compare speeds with both machines cool.
 - **Per-chunk timing.** Start the helper with `STRIX_CHUNK_LOG=1` to log, for each chunk, how long the Halo waited for the Mac and how long it computed. A Halo that never waits is the slower side; a larger layer count then makes things slower, a smaller one faster.
