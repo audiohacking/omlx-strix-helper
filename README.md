@@ -17,14 +17,14 @@ Alpha. Qwen3.8 27B and Qwen3.8 Flash-Next have optimized kernels on the Radeon; 
 
 ## Results
 
-Prefill tok/s on a 64K-token prompt with an M3 Ultra (512 GB), oQ4e checkpoints, and the increase over the M3 Ultra alone. Decode always stays on the Mac.
+Prefill tok/s on a 64K-token prompt with an M3 Ultra (512 GB), oQ4e checkpoints. Decode always stays on the Mac.
 
 | Model | M3 Ultra alone | + Strix Halo | + DGX Spark | + 2x RTX A6000 |
 | --- | ---: | ---: | ---: | ---: |
-| Qwen3.8 27B | 404 | 831 (+106%) | 1,062 (+202%) | 1,879 (+434%) |
-| Qwen3.8 Flash-Next | 1,376 | 2,160 (+57%) | 2,715 (+98%) | 3,928 (+187%) |
+| Qwen3.8 27B | 404 | 831 | 1,062 | 1,879 |
+| Qwen3.8 Flash-Next | 1,376 | 2,160 | 2,715 | 3,928 |
 
-* The DGX Spark and RTX A6000 figures and their increases are from the [oMLX 0.8.0 release](https://github.com/jundot/omlx/releases/tag/v0.8.0), over 2.5 GbE, where the M3 Ultra alone reads 352 (27B) and 1,370 (Flash-Next).
+* The DGX Spark and RTX A6000 figures are from the [oMLX 0.8.0 release](https://github.com/jundot/omlx/releases/tag/v0.8.0), over 2.5 GbE, where the M3 Ultra alone reads 352 (27B) and 1,370 (Flash-Next).
 * The Strix Halo figures are over Thunderbolt.
 
 M3 Ultra with one Strix Halo, 64 generated tokens, MTP on:
