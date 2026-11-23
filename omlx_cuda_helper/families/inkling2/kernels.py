@@ -716,11 +716,13 @@ for (int rt = 0; rt < RT; ++rt) {
 """
 
 
-# A workgroup's 16-row tiles, each wave's 16-column tiles, and its waves. On
-# gfx1151 more tiles per wave spill; fewer reload the weights more often.
-_NVFP4_ROW_TILES = 2
-_NVFP4_COL_TILES = 4
-_NVFP4_WAVES = 4
+# A workgroup's 16-row tiles, each wave's 16-column tiles, and its waves. A
+# decoded weight tile serves every row tile, so more row tiles spend less of
+# the VALU (which also issues the WMMA) on decoding; on gfx1151 six row tiles
+# of two column tiles, eight waves to a workgroup, beat 2 x 4 by a fifth.
+_NVFP4_ROW_TILES = 6
+_NVFP4_COL_TILES = 2
+_NVFP4_WAVES = 8
 
 
 @functools.cache
@@ -740,7 +742,7 @@ def nvfp4_fits(bank) -> bool:
     if bank.quant.get("mode") != "nvfp4" or weight.ndim != 3:
         return False
     inputs = weight.shape[2] * 8
-    return weight.shape[1] % 64 == 0 and inputs % 64 == 0
+    return weight.shape[1] % (16 * _NVFP4_COL_TILES) == 0 and inputs % 64 == 0
 
 
 def nvfp4_pack(bank) -> tuple[mx.array, mx.array]:
