@@ -25,7 +25,10 @@ Arrays = dict[str, HostArray]
 
 
 class Stage:
-    def __init__(self, model_dir: str | Path, first: int, last: int):
+    def __init__(
+        self, model_dir: str | Path, first: int, last: int, owner=owner
+    ):
+        """``owner`` maps a tensor to its layer, None or False (not loaded)."""
         config = checkpoint.load_config(model_dir)
         self.cfg = Config.from_text(text_config(config))
         self.first, self.last = first, last
