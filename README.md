@@ -5,15 +5,9 @@
 
 A prefill accelerator for AMD Strix Halo that pairs with oMLX as a CUDA helper.
 
-oMLX can hand the front of a long prompt to a second machine while the Mac keeps decode, the KV cache, and the API. The oMLX 0.8.0 release does this with a DGX Spark or RTX A6000 GPUs. This worker puts a Strix Halo (Radeon 8060S, gfx1151) in the same seat. It speaks the same discovery, pairing, control, and data protocol, so the oMLX Cluster tab works with it as is.
+oMLX can hand the front of a long prompt to a second machine while the Mac keeps decode, the KV cache, and the API. The oMLX 0.8.0 release does this with a DGX Spark or RTX A6000 GPUs. This helper puts a Strix Halo (Radeon 8060S, gfx1151) in the same seat. It speaks the same discovery, pairing, control, and data protocol, so the oMLX Cluster tab works with it as is.
 
-The package name is `omlx_cuda_helper`, so the oMLX protocol tests import it unchanged. In an oMLX tree it lives at `apps/omlx-strixworker`.
-
-Setup is in [DEMO.md](DEMO.md): find the device, Pair, and Check.
-
-## Status
-
-Alpha. Qwen3.8 27B, Qwen3.8 Flash-Next and Inkling 2 have optimized kernels on the Radeon; the other families run on portable ops.
+Status: alpha. Qwen3.8 27B, Qwen3.8 Flash-Next and Inkling 2 have optimized kernels on the Radeon; the other families run on portable ops.
 
 ## Results
 
@@ -46,7 +40,85 @@ Inkling 2 Mini, 512 generated tokens:
 | 32,768 | 1,598 | 2,654 | 20.5 s → 12.3 s | 84 |
 | 65,536 | 1,398 | 2,468 | 46.9 s → 26.6 s | 72 |
 
-Inkling 2 Mini runs its middle layers three times per token. Splitting it inside those repeats needs the [audiohacking/omlx](https://github.com/audiohacking/omlx) fork; stock oMLX does not split this model yet.
+## Quick start
+
+You need a Mac running oMLX and a Strix Halo on the same network, joined by a fast cable (see [The cable](#the-cable)). Hardware notes are in [DEMO.md](DEMO.md).
+
+**1. On the Halo, start the helper.** The image is `ghcr.io/audiohacking/omlx-strix-helper` (linux/amd64, gfx1151). It contains everything the helper needs: the ROCm runtime, the MLX build, and the compiled kernels.
+
+```bash
+docker run -d --name omlx-helper --restart unless-stopped \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add video --group-add render \
+  --network host --ipc host \
+  -v omlx-helper:/data \
+  ghcr.io/audiohacking/omlx-strix-helper
+docker logs -f omlx-helper
+```
+
+With rootless podman, pass the caller's groups instead, and let the container outlive the login that started it (`loginctl enable-linger`):
+
+```bash
+podman run -d --name omlx-helper --restart unless-stopped \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add keep-groups \
+  --network host --ipc host \
+  -v omlx-helper:/data \
+  ghcr.io/audiohacking/omlx-strix-helper
+```
+
+Host networking lets the Cluster tab find the helper. The volume holds its identity, its pairings, the model files oMLX copies over, and the kernel cache. Arguments after the image name go to `serve`, for example `--name halo` for the name shown in the Cluster tab.
+
+**2. On the Mac, run oMLX.** Use the [audiohacking/omlx](https://github.com/audiohacking/omlx) fork when the cable is Thunderbolt, and for Inkling 2 Mini; stock oMLX works over 10G for the other models.
+
+```bash
+git clone https://github.com/audiohacking/omlx.git
+cd omlx
+make install
+.venv/bin/omlx serve --host 0.0.0.0 --port 8000
+```
+
+**3. Pair.** In oMLX, open Cluster, Find devices, Pair the Halo, then Check. Check shows the cable in use: **80000 Mbit/s** on Thunderbolt, **10000 Mbit/s** on 10G.
+
+<img width="1130" height="644" alt="image" src="https://github.com/user-attachments/assets/85a1424a-5e0e-4ff4-94d1-4e2dde91eb0e" />
+
+**4. Turn the helper on for a model** in its settings (Prefill helper: the paired Halo). Both machines use the same checkpoint; oMLX copies the layers the Halo needs.
+
+## Recommended settings
+
+`Qwen3.8-27B-oQ4e`:
+
+- Prefill helper: the paired Halo, layer count on Auto.
+- MTP on, VLM MTP off.
+- Native bf16 KV. Float16 activations, TurboQuant, affine KV, and INT8 activation prefill off.
+- ANE prefill on: sequence 2048, fraction 0.53, dual ANE, GDN fraction 0.5, GDN layers capped at 48, tail padding from 512 tokens. ANE and the helper work independently.
+- Speculative prefill and DFlash off.
+
+`Qwen3.8-Flash-Next-oQ4e-mtp`:
+
+- Prefill helper: the paired Halo, layer count **20 or 21** of 48. Auto works too and lands close to that.
+- MTP on. Other settings at their defaults.
+
+`Inkling-2-Mini-oQ4e-mtp` (needs the fork):
+
+- Prefill helper: the paired Halo, layer count **24** of 48. Auto works too and lands a little lower.
+- MTP on. Other settings at their defaults.
+
+## Models
+
+The same families and contract versions as the CUDA helper.
+
+| Family | `model_type` | On the Radeon |
+| --- | --- | --- |
+| Qwen3.8 27B | `qwen3_5` | Optimized kernels |
+| Qwen3.8 Flash-Next | `qwen4_exp` | Optimized kernels |
+| MiniMax M3 / M3.1 | `minimax_m3_vl` | Portable ops |
+| GLM-5.3 Flash | `glm5_next` | Portable ops |
+| DeepSeek V4.1 | `deepseek_v41` | Portable ops |
+| Inkling 2 Small | `inkling2` | Optimized kernels |
+| Inkling 2 Mini | `inkling2_loop` | Optimized kernels |
+
+Every family matches oMLX's recorded contract output on gfx1151. oQh checkpoints stay on the Mac, and checkpoints with 3-bit experts are not supported on the Halo yet. Inkling 2 Mini runs its middle layers three times per token; splitting it inside those repeats needs the [audiohacking/omlx](https://github.com/audiohacking/omlx) fork.
 
 ## The cable
 
@@ -54,9 +126,25 @@ Inkling 2 Mini runs its middle layers three times per token. Splitting it inside
 
 **Thunderbolt or USB, with the patch.** The Mac puts that port in a bridge, which has a link-local address and no media speed, so stock oMLX stays on gigabit. The [audiohacking/omlx](https://github.com/audiohacking/omlx) fork ranks the bridge by the speed the Halo reports, 80 Gbit/s. If a 10G path is also up, leave the bridge down: while the bridge answers, the fork prefers it.
 
-After Pair, Check shows the cable in use. 10G reads **10000 Mbit/s** and the bridge reads **80000 Mbit/s**. **1000 Mbit/s** is the wrong cable.
+**1000 Mbit/s** in Check is the wrong cable. [DEMO.md](DEMO.md) has the diagram and the details.
 
-<img width="1130" height="644" alt="image" src="https://github.com/user-attachments/assets/85a1424a-5e0e-4ff4-94d1-4e2dde91eb0e" />
+## Updating
+
+```bash
+docker pull ghcr.io/audiohacking/omlx-strix-helper
+docker rm -f omlx-helper
+```
+
+Then the same `docker run` as above. The volume keeps the pairing, the model files, and the kernel cache. Other commands run in the container, for example `docker exec omlx-helper omlx-strixworker --state-dir /data status`. oMLX expects helper 0.1.7 or newer.
+
+## Troubleshooting
+
+- **Prefill close to the Mac's own speed.** Check that the cable reads 10000 or 80000 Mbit/s in Check. A gigabit path, or a helper that dropped out, looks like this.
+- **First prompt after an update is slower.** With the layer count on Auto, oMLX first re-measures both sides; later prompts settle.
+- **Speed drops over long sessions.** Both machines lower their GPU clocks under sustained load. After ten minutes or more of continuous long prompts, the Mac's own prefill can run about a fifth slower until it has cooled for a few minutes; keep the Halo's BIOS power mode on Balanced. Compare speeds with both machines cool.
+- **Per-chunk timing.** Run the helper with `-e STRIX_CHUNK_LOG=1` to log, for each chunk, how long the Halo waited for the Mac and how long it computed. A Halo that never waits is the slower side; a larger layer count then makes things slower, a smaller one faster.
+
+---
 
 ## How it works
 
@@ -83,58 +171,11 @@ On the Radeon, every kernel is checked against the plain MLX ops when a model lo
 - **Attention**: one WMMA kernel per layer covers every query head that shares a key/value head, with the relative-position bias and the attention sink built in.
 - **Glue**: the depth mix with its norms, the short convolutions with their residual adds, the clips, the output gate and the loop controllers are one kernel each.
 
-## Models
+## Build from source
 
-The same families and contract versions as the CUDA helper.
+**The image.** `docker build -t omlx-strix-helper .` in this folder compiles the worker, the attention library, and the MLX library it imports (`mlx-build/`). It does not build oMLX. Releases of this repo publish the image to `ghcr.io/audiohacking/omlx-strix-helper`.
 
-| Family | `model_type` | On the Radeon |
-| --- | --- | --- |
-| Qwen3.8 27B | `qwen3_5` | Optimized kernels |
-| Qwen3.8 Flash-Next | `qwen4_exp` | Optimized kernels |
-| MiniMax M3 / M3.1 | `minimax_m3_vl` | Portable ops |
-| GLM-5.3 Flash | `glm5_next` | Portable ops |
-| DeepSeek V4.1 | `deepseek_v41` | Portable ops |
-| Inkling 2 Small | `inkling2` | Optimized kernels |
-| Inkling 2 Mini | `inkling2_loop` | Optimized kernels |
-
-Every family matches oMLX's recorded contract output on gfx1151. oQh checkpoints stay on the Mac, and checkpoints with 3-bit experts are not supported on the Halo yet.
-
-## Run with Docker
-
-The image contains the helper only; oMLX stays on the Mac. It is the Strix Halo alternative to [`jundot/omlx-cuda-helper`](https://github.com/jundot/omlx/blob/main/apps/omlx-cuda-helper/README.md), with the same discovery, pairing, ports, and data frames.
-
-`ghcr.io/audiohacking/omlx-strix-helper` is linux/amd64 for gfx1151, built on each release of this repo. The Halo needs a ROCm-capable kernel and the render devices passed through:
-
-```bash
-docker run -d --name omlx-helper --restart unless-stopped \
-  --device=/dev/kfd --device=/dev/dri \
-  --group-add video --group-add render \
-  --network host --ipc host \
-  -v omlx-helper:/data \
-  ghcr.io/audiohacking/omlx-strix-helper
-docker logs -f omlx-helper
-```
-
-Host networking lets the Cluster tab find the helper. The volume holds the identity, the pairings, the model files oMLX copies over, and the kernel cache. Arguments after the image name go to `serve`, for example `--name halo`.
-
-Rootless podman does not see the `render` and `video` group names, so pass the caller's groups instead. The container also has to outlive the login that started it (`loginctl enable-linger`):
-
-```bash
-podman run -d --name omlx-helper --restart unless-stopped \
-  --device=/dev/kfd --device=/dev/dri \
-  --group-add keep-groups \
-  --network host --ipc host \
-  -v omlx-helper:/data \
-  ghcr.io/audiohacking/omlx-strix-helper
-```
-
-To update, run `docker pull ghcr.io/audiohacking/omlx-strix-helper`, then `docker rm -f omlx-helper` and the same `docker run`. The volume keeps the pairing and the model files. Other commands run in the container, for example `docker exec omlx-helper omlx-strixworker --state-dir /data status`.
-
-To build the image yourself, run `docker build -t omlx-strix-helper .` in this folder. That compiles the worker and the MLX library it imports (`mlx-build/`). It does not build oMLX.
-
-## Build
-
-The attention library is a gfx1151 binary and stays out of git. Build it on the Halo:
+**Without a container.** The worker builds on MLX `fc344c9` with the mlxcel ROCm overlay and the patch series in `mlx-build/` (`patches/rocm-cuda-kernel-hip.patch` forwards `mx.fast.cuda_kernel` to the HIP JIT; `patches/nvfp4-gfx1151-hipcc.patch` lets hipcc 7.18 compile `nvfp4_gather_expert_batched_kernel` for gfx1151), on ROCm `10.3.0a20261120`. A source install also compiles the attention library, which is a gfx1151 binary and stays out of git (the image already has it):
 
 ```bash
 hipcc -O3 -shared -fPIC --offload-arch=gfx1151 -std=c++20 \
@@ -142,7 +183,18 @@ hipcc -O3 -shared -fPIC --offload-arch=gfx1151 -std=c++20 \
   -o omlx_cuda_helper/families/qwen3_5/libgufo_attn.so
 ```
 
-The worker builds on MLX `fc344c9` with the mlxcel ROCm overlay and ROCm `10.3.0a20261120`. `patches/nvfp4-gfx1151-hipcc.patch` lets hipcc 7.18 compile `nvfp4_gather_expert_batched_kernel` for gfx1151.
+Then install and serve, with `rocm-sdk` on `PATH` and `ROCM_PATH` set to that SDK:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e .
+export PATH="$HOME/rocm-env/bin:$PATH"
+export ROCM_PATH="$(rocm-sdk path --root)"
+export LD_LIBRARY_PATH="$ROCM_PATH/lib:$HOME/rocm-env/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+omlx-strixworker serve --name halo
+```
+
+State lives in `~/.omlx-cuda-helper`. Pass `--pair` only to join an oMLX that has not paired this helper yet. The package name is `omlx_cuda_helper`, so the oMLX protocol tests import it unchanged; in an oMLX tree it lives at `apps/omlx-strixworker`.
 
 ## Tests
 
