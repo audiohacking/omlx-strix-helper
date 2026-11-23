@@ -868,6 +868,84 @@ def nvfp4_gemm(
     )[0]
 
 
+# The router logits for HIP: x [L, K] bf16 times the float32 router [E, K],
+# held as two bf16 halves (hi + lo carry 16 of its 24 mantissa bits; each
+# product is exact in float32), accumulated in float32 with WMMA. A wave
+# takes 16 rows and 64 experts.
+_ROUTER_HIP = """
+const int lane = threadIdx.x & 31, sub = lane & 15, half = lane >> 4;
+const int wave = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+const int L = dims[0];
+const int r0 = (wave / (E / 64)) * 16, e0 = (wave % (E / 64)) * 64;
+if (r0 >= L) return;
+const unsigned short* xp = reinterpret_cast<const unsigned short*>(x) + (size_t)min(r0 + sub, L - 1) * K;
+const unsigned short* hp = reinterpret_cast<const unsigned short*>(hi);
+const unsigned short* lp = reinterpret_cast<const unsigned short*>(lo);
+ink_v8f acc[4];
+#pragma unroll
+for (int q = 0; q < 4; ++q) acc[q] = (ink_v8f){};
+for (int ks = 0; ks < K / 16; ++ks) {
+  const ink_v16s a = ink_load16(xp + ks * 16);
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    const size_t at = (size_t)(e0 + q * 16 + sub) * K + ks * 16;
+    acc[q] = ink_wmma_bf16(a, ink_load16(hp + at), acc[q]);
+    acc[q] = ink_wmma_bf16(a, ink_load16(lp + at), acc[q]);
+  }
+}
+#pragma unroll
+for (int q = 0; q < 4; ++q) {
+  float vals[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) vals[i] = acc[q][i];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int r = r0 + 2 * i + half;
+    if (r < L) logits[(size_t)r * E + e0 + q * 16 + sub] = vals[i];
+  }
+}
+"""
+
+
+@functools.cache
+def _router_hip_kernel():
+    return mx.fast.cuda_kernel(
+        name="omlx_inkling2_router_hip",
+        input_names=["x", "hi", "lo", "dims"],
+        output_names=["logits"],
+        source=_ROUTER_HIP,
+        header=_NVFP4_HEADER,
+    )
+
+
+def router_halves(router: mx.array) -> tuple[mx.array, mx.array]:
+    """The float32 router [E, K] as bf16 hi and lo halves."""
+    hi = router.astype(mx.bfloat16)
+    lo = (router - hi.astype(mx.float32)).astype(mx.bfloat16)
+    return hi, lo
+
+
+def router_fits(x: mx.array, router: mx.array) -> bool:
+    experts, inputs = router.shape
+    return x.dtype == mx.bfloat16 and experts % 64 == 0 and inputs % 16 == 0
+
+
+def router_logits_hip(x: mx.array, halves) -> mx.array:
+    """``x.astype(float32) @ router.T`` [L, E] from ``router_halves``."""
+    hi, lo = halves
+    rows = x.shape[0]
+    experts, inputs = hi.shape
+    waves = -(-rows // 16) * (experts // 64)
+    return _router_hip_kernel()(
+        inputs=[mx.contiguous(x), hi, lo, mx.array([rows], dtype=mx.int32)],
+        template=[("K", inputs), ("E", experts)],
+        grid=(-(-waves * 32 // 256) * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, experts)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
 # The routed rows of a chunk laid out by expert, in one workgroup: counts in
 # LDS, the expert offsets and row-tile starts, then each (token, slot) entry
 # takes the next row of its expert. Rows of an expert come in any order;
@@ -2288,8 +2366,16 @@ def enable(cfg, dtype: mx.Dtype) -> None:
         got = nvfp4_gemm(x, packed, rows, act=(bank.post, caps))
         _check("actfuse", mx.array_equal(got, want).item(), "differs from the activation kernel")
 
+    def check_router_hip():
+        router = mx.random.normal((cfg.experts, cfg.hidden)) * 0.02
+        x = mx.random.normal((70, cfg.hidden)).astype(dtype)
+        want = x.astype(mx.float32) @ router.T
+        error = _relative(router_logits_hip(x, router_halves(router)), want)
+        _check("router_hip", error <= 1e-4, f"relative error {error:.2e}")
+
     if _rocm():
         _guarded("nvfp4", check_nvfp4)
+        _guarded("router_hip", check_router_hip)
         _guarded("actfuse", check_activation_fused)
         _guarded("convres", check_conv_residual)
         _guarded("mixnorm", check_mix_fused)

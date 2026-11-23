@@ -457,6 +457,8 @@ class Experts:
         self.bias = w["mlp.router_bias"]
         # The router weight as [K, experts], the layout the router kernel reads.
         self.columns = mx.contiguous(self.router.T)
+        # The router as bf16 halves, for the ROCm router kernel (on first use).
+        self.halves = None
         self.caps = (
             mx.array(cfg.gate_cap, dtype=mx.float32),
             mx.array(cfg.up_cap, dtype=mx.float32),
@@ -477,6 +479,10 @@ class Experts:
         cfg = self.cfg
         if kernels.enabled("router_logits") and x.dtype == mx.bfloat16:
             logits = kernels.router_logits(x, self.columns)
+        elif kernels.enabled("router_hip") and kernels.router_fits(x, self.router):
+            if self.halves is None:
+                self.halves = kernels.router_halves(self.router)
+            logits = kernels.router_logits_hip(x, self.halves)
         else:
             logits = x.astype(mx.float32) @ self.router.T
         if kernels.enabled("route"):
