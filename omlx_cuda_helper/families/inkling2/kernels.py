@@ -459,16 +459,37 @@ typedef unsigned int ink_v4u __attribute__((ext_vector_type(4)));
 __device__ __forceinline__ ink_v8f ink_wmma_bf16(ink_v16s a, ink_v16s b, ink_v8f c) {
   return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
 }
-// Eight E2M1 codes of a word as bf16, in element order: a magnitude table
+// The bf16 bytes of code * scale for the eight E2M1 magnitudes, as byte
+// tables: [low bytes 0-3, low 4-7, high 0-3, high 4-7]. The products have at
+// most five significant bits, so the truncation to bf16 is exact.
+__device__ __forceinline__ float ink_e4m3(unsigned b);
+__device__ __forceinline__ void ink_fp4_table(unsigned b, unsigned* t) {
+  const float scale = ink_e4m3(b);
+  const unsigned f0 = 0u, f1 = __builtin_bit_cast(unsigned, 0.5f * scale),
+                 f2 = __builtin_bit_cast(unsigned, scale),
+                 f3 = __builtin_bit_cast(unsigned, 1.5f * scale),
+                 f4 = __builtin_bit_cast(unsigned, 2.f * scale),
+                 f5 = __builtin_bit_cast(unsigned, 3.f * scale),
+                 f6 = __builtin_bit_cast(unsigned, 4.f * scale),
+                 f7 = __builtin_bit_cast(unsigned, 6.f * scale);
+  // [low of i, low of i + 1, high of i, high of i + 1]
+  const unsigned a01 = __builtin_amdgcn_perm(f1, f0, 0x07030602u);
+  const unsigned a23 = __builtin_amdgcn_perm(f3, f2, 0x07030602u);
+  const unsigned a45 = __builtin_amdgcn_perm(f5, f4, 0x07030602u);
+  const unsigned a67 = __builtin_amdgcn_perm(f7, f6, 0x07030602u);
+  t[0] = __builtin_amdgcn_perm(a23, a01, 0x05040100u);
+  t[1] = __builtin_amdgcn_perm(a67, a45, 0x05040100u);
+  t[2] = __builtin_amdgcn_perm(a23, a01, 0x07060302u);
+  t[3] = __builtin_amdgcn_perm(a67, a45, 0x07060302u);
+}
+// Eight E2M1 codes of a word as bf16 code * scale, in element order: a table
 // lookup for the low and high byte of each, the sign, then interleaving.
-__device__ __forceinline__ void ink_fp4_word(unsigned x, unsigned* out) {
-  constexpr unsigned TH_LO = 0x3F3F3F00u, TH_HI = 0x40404040u;
-  constexpr unsigned TL_LO = 0xC0800000u, TL_HI = 0xC0804000u;
+__device__ __forceinline__ void ink_fp4_word(unsigned x, const unsigned* t, unsigned* out) {
   const unsigned m_even = x & 0x07070707u, m_odd = (x >> 4) & 0x07070707u;
-  const unsigned l_even = __builtin_amdgcn_perm(TL_HI, TL_LO, m_even);
-  const unsigned h_even = __builtin_amdgcn_perm(TH_HI, TH_LO, m_even) | ((x << 4) & 0x80808080u);
-  const unsigned l_odd = __builtin_amdgcn_perm(TL_HI, TL_LO, m_odd);
-  const unsigned h_odd = __builtin_amdgcn_perm(TH_HI, TH_LO, m_odd) | (x & 0x80808080u);
+  const unsigned l_even = __builtin_amdgcn_perm(t[1], t[0], m_even);
+  const unsigned h_even = __builtin_amdgcn_perm(t[3], t[2], m_even) ^ ((x << 4) & 0x80808080u);
+  const unsigned l_odd = __builtin_amdgcn_perm(t[1], t[0], m_odd);
+  const unsigned h_odd = __builtin_amdgcn_perm(t[3], t[2], m_odd) ^ (x & 0x80808080u);
   // [low, high] of the even codes 0, 2 and 4, 6; then of the odd codes.
   const unsigned e01 = __builtin_amdgcn_perm(h_even, l_even, 0x05010400u);
   const unsigned e23 = __builtin_amdgcn_perm(h_even, l_even, 0x07030602u);
@@ -479,10 +500,10 @@ __device__ __forceinline__ void ink_fp4_word(unsigned x, unsigned* out) {
   out[2] = __builtin_amdgcn_perm(o23, e23, 0x05040100u);
   out[3] = __builtin_amdgcn_perm(o23, e23, 0x07060302u);
 }
-__device__ __forceinline__ ink_v16s ink_fp4(const unsigned* p) {
+__device__ __forceinline__ ink_v16s ink_fp4(const unsigned* p, const unsigned* t) {
   union { ink_v16s f; unsigned u[8]; } c;
-  ink_fp4_word(p[0], c.u);
-  ink_fp4_word(p[1], c.u + 4);
+  ink_fp4_word(p[0], t, c.u);
+  ink_fp4_word(p[1], t, c.u + 4);
   return c.f;
 }
 __device__ __forceinline__ float ink_e4m3(unsigned b) {
@@ -499,63 +520,147 @@ __device__ __forceinline__ ink_v16s ink_load16(const unsigned short* p) {
 }
 """
 _NVFP4_EXPERTS = """
-constexpr int NG = 4;
-constexpr int KS = K / 16;
-const int lane = threadIdx.x, sub = lane & 15, half = lane >> 4;
-const int og0 = blockIdx.y * NG;
-const int e = blockIdx.z;
-const int begin = offsets[e], end = offsets[e + 1];
-const int r0 = begin + blockIdx.x * 16;
-if (og0 >= N / 16 || r0 >= end) return;
-const int row = r0 + sub;
-const int live = row < end ? row : end - 1;
-const unsigned short* xp = reinterpret_cast<const unsigned short*>(x) + (size_t)live * K;
-ink_v8f acc[NG];
+// A workgroup of WAVES waves takes RT 16-row tiles of one expert and WAVES
+// adjacent groups of NG 16-column tiles. The rows go through LDS a KC-wide
+// slice at a time, loaded once for all the waves, the next slice in flight
+// while this one is used.
+constexpr int KS = K / 16, KC = 64, NC = K / KC, ROWS = 16 * RT;
+constexpr int PITCH = KC + 8;  // halves; staggers the rows across LDS banks
+constexpr int THREADS = 32 * WAVES, PIECES = ROWS * KC / 8;
+constexpr int EACH = (PIECES + THREADS - 1) / THREADS;
+__shared__ __attribute__((aligned(16))) unsigned short lds[2][ROWS * PITCH];
+const int tid = threadIdx.x, lane = tid & 31, sub = lane & 15, half = lane >> 4;
+const int og0 = (blockIdx.y * WAVES + (tid >> 5)) * NG;
+const bool cols = og0 < N / 16;
+// Workgroup x takes row tile x of the experts' tiles laid end to end:
+// first[e] is expert e's first tile, the extra x past the last tile none.
+const int t = blockIdx.x;
+if (t >= first[E]) return;
+int lo = 0, hi = E;
+while (hi - lo > 1) {
+  const int mid = (lo + hi) >> 1;
+  if (first[mid] <= t) lo = mid; else hi = mid;
+}
+const int e = lo;
+const int end = offsets[e + 1];
+const int r0 = offsets[e] + (t - first[e]) * ROWS;
+const int tiles = min(RT, (end - r0 + 15) / 16);
+const unsigned short* xs = reinterpret_cast<const unsigned short*>(x);
+ink_v4u stage[EACH];
+auto fetch = [&](int c) {
+#pragma unroll
+  for (int j = 0; j < EACH; ++j) {
+    const int piece = tid + j * THREADS;
+    if (piece < PIECES) {
+      const int r = piece / (KC / 8), col = (piece % (KC / 8)) * 8;
+      const int row = min(r0 + r, end - 1);
+      stage[j] = *reinterpret_cast<const ink_v4u*>(xs + (size_t)row * K + c * KC + col);
+    }
+  }
+};
+auto put = [&](int buf) {
+#pragma unroll
+  for (int j = 0; j < EACH; ++j) {
+    const int piece = tid + j * THREADS;
+    if (piece < PIECES) {
+      const int r = piece / (KC / 8), col = (piece % (KC / 8)) * 8;
+      *reinterpret_cast<ink_v4u*>(&lds[buf][r * PITCH + col]) = stage[j];
+    }
+  }
+};
+ink_v8f acc[RT][NG];
 const unsigned* wc[NG];
 const unsigned char* sc[NG];
 #pragma unroll
 for (int ogi = 0; ogi < NG; ++ogi) {
-  acc[ogi] = (ink_v8f){};
-  const size_t tile = size_t(e) * (N / 16) + og0 + ogi;
-  wc[ogi] = w + tile * KS * 32 + sub * 2;
-  sc[ogi] = s + tile * KS * 16 + sub;
+#pragma unroll
+  for (int rt = 0; rt < RT; ++rt) acc[rt][ogi] = (ink_v8f){};
+  const size_t tile = size_t(e) * (N / 16) + (cols ? og0 + ogi : 0);
+  wc[ogi] = w + tile * NC * 128 + sub * 8;
+  sc[ogi] = s + tile * NC * 64 + sub * 4;
 }
-for (int ks = 0; ks < KS; ++ks) {
-  const ink_v16s a = ink_load16(xp + ks * 16);
+fetch(0);
+put(0);
+__syncthreads();
+for (int c = 0; c < NC; ++c) {
+  const int buf = c & 1;
+  if (c + 1 < NC) fetch(c + 1);
+  if (cols) {
+    // A lane's codes and scales of a tile for the whole slice: eight words
+    // (two per 16 inputs) and four scales.
+    ink_v4u code[NG][2];
+    unsigned scale[NG];
 #pragma unroll
-  for (int ogi = 0; ogi < NG; ++ogi) {
-    const ink_v8f p = ink_wmma_bf16(a, ink_fp4(wc[ogi] + ks * 32), (ink_v8f){});
-    const float scale = ink_e4m3(sc[ogi][ks * 16]);
+    for (int ogi = 0; ogi < NG; ++ogi) {
+      code[ogi][0] = *reinterpret_cast<const ink_v4u*>(wc[ogi] + c * 128);
+      code[ogi][1] = *reinterpret_cast<const ink_v4u*>(wc[ogi] + c * 128 + 4);
+      scale[ogi] = *reinterpret_cast<const unsigned*>(sc[ogi] + c * 64);
+    }
 #pragma unroll
-    for (int i = 0; i < 8; ++i) acc[ogi][i] += scale * p[i];
+    for (int kk = 0; kk < KC / 16; ++kk) {
+      // A lane's column of a tile shares one scale: the codes decode straight
+      // to code * scale, exact in bf16. Each decoded tile serves every row tile.
+      ink_v16s b[NG];
+#pragma unroll
+      for (int ogi = 0; ogi < NG; ++ogi) {
+        unsigned table[4], words[2];
+        ink_fp4_table((scale[ogi] >> (8 * kk)) & 0xffu, table);
+        words[0] = code[ogi][kk >> 1][(kk & 1) * 2];
+        words[1] = code[ogi][kk >> 1][(kk & 1) * 2 + 1];
+        b[ogi] = ink_fp4(words, table);
+      }
+#pragma unroll
+      for (int rt = 0; rt < RT; ++rt) {
+        if (rt < tiles) {
+          const ink_v16s a = ink_load16(&lds[buf][(rt * 16 + sub) * PITCH + kk * 16]);
+#pragma unroll
+          for (int ogi = 0; ogi < NG; ++ogi) acc[rt][ogi] = ink_wmma_bf16(a, b[ogi], acc[rt][ogi]);
+        }
+      }
+    }
+  }
+  if (c + 1 < NC) {
+    put(buf ^ 1);
+    __syncthreads();
   }
 }
+if (!cols) return;
 unsigned short* yb = reinterpret_cast<unsigned short*>(y);
 #pragma unroll
-for (int ogi = 0; ogi < NG; ++ogi) {
-  // Element i of the accumulator is row 2 i + half; copied out first, as an
-  // indexed read of the vector inside the guarded loop read element 0 only.
-  float vals[8];
+for (int rt = 0; rt < RT; ++rt) {
 #pragma unroll
-  for (int i = 0; i < 8; ++i) vals[i] = acc[ogi][i];
+  for (int ogi = 0; ogi < NG; ++ogi) {
+    // Element i of the accumulator is row 2 i + half; copied out first, as an
+    // indexed read of the vector inside the guarded loop read element 0 only.
+    float vals[8];
 #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const int r = r0 + 2 * i + half;
-    if (r < end) {
-      const unsigned u = __builtin_bit_cast(unsigned, vals[i]);
-      yb[(size_t)r * N + (og0 + ogi) * 16 + sub] =
-          (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    for (int i = 0; i < 8; ++i) vals[i] = acc[rt][ogi][i];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int r = r0 + rt * 16 + 2 * i + half;
+      if (r < end) {
+        const unsigned u = __builtin_bit_cast(unsigned, vals[i]);
+        yb[(size_t)r * N + (og0 + ogi) * 16 + sub] =
+            (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+      }
     }
   }
 }
 """
 
 
+# A workgroup's 16-row tiles, each wave's 16-column tiles, and its waves. On
+# gfx1151 more tiles per wave spill; fewer reload the weights more often.
+_NVFP4_ROW_TILES = 2
+_NVFP4_COL_TILES = 4
+_NVFP4_WAVES = 4
+
+
 @functools.cache
 def _nvfp4_kernel():
     return mx.fast.cuda_kernel(
         name="omlx_inkling2_nvfp4_experts",
-        input_names=["x", "w", "s", "offsets"],
+        input_names=["x", "w", "s", "offsets", "first"],
         output_names=["y"],
         source=_NVFP4_EXPERTS,
         header=_NVFP4_HEADER,
@@ -568,17 +673,19 @@ def nvfp4_fits(bank) -> bool:
     if bank.quant.get("mode") != "nvfp4" or weight.ndim != 3:
         return False
     inputs = weight.shape[2] * 8
-    return weight.shape[1] % 64 == 0 and inputs % 16 == 0
+    return weight.shape[1] % 64 == 0 and inputs % 64 == 0
 
 
 def nvfp4_pack(bank) -> tuple[mx.array, mx.array]:
-    """(codes, scales) of an NVFP4 bank in the order the kernel reads them."""
+    """(codes, scales) of an NVFP4 bank in the order the kernel reads them:
+    per 16-column tile and 64 inputs, each column's eight code words and
+    four scales together."""
     count, width, words = bank.weight.shape
-    codes = bank.weight.reshape(count, width // 16, 16, words // 2, 2)
+    codes = bank.weight.reshape(count, width // 16, 16, words // 8, 8)
     codes = mx.contiguous(codes.transpose(0, 1, 3, 2, 4))
     groups = bank.scales.shape[-1]
-    scales = bank.scales.reshape(count, width // 16, 16, groups)
-    return codes, mx.contiguous(scales.transpose(0, 1, 3, 2))
+    scales = bank.scales.reshape(count, width // 16, 16, groups // 4, 4)
+    return codes, mx.contiguous(scales.transpose(0, 1, 3, 2, 4))
 
 
 def nvfp4_gemm(x: mx.array, packed, experts: mx.array) -> mx.array:
@@ -587,16 +694,28 @@ def nvfp4_gemm(x: mx.array, packed, experts: mx.array) -> mx.array:
     codes, scales = packed
     count, tiles = codes.shape[0], codes.shape[1]
     rows, inputs = x.shape
+    waves = _NVFP4_WAVES
+    tile_rows = 16 * _NVFP4_ROW_TILES
+    zero = mx.zeros((1,), dtype=mx.int32)
     counts = mx.zeros((count,), dtype=mx.int32).at[experts.astype(mx.int32)].add(1)
-    offsets = mx.concatenate([mx.zeros((1,), dtype=mx.int32), mx.cumsum(counts)])
-    span = int(mx.max(counts).item())
-    blocks = max(1, -(-span // 16))
+    offsets = mx.concatenate([zero, mx.cumsum(counts)])
+    # Each expert's rows in whole tiles; the grid covers the most there can be
+    # without reading the counts back.
+    first = mx.concatenate([zero, mx.cumsum((counts + tile_rows - 1) // tile_rows)])
+    blocks = -(-rows // tile_rows) + count
     width = tiles * 16
     return _nvfp4_kernel()(
-        inputs=[mx.contiguous(x), codes, scales, offsets],
-        template=[("K", inputs), ("N", width)],
-        grid=(blocks * 32, width // 64, count),
-        threadgroup=(32, 1, 1),
+        inputs=[mx.contiguous(x), codes, scales, offsets, first],
+        template=[
+            ("K", inputs),
+            ("N", width),
+            ("E", count),
+            ("RT", _NVFP4_ROW_TILES),
+            ("NG", _NVFP4_COL_TILES),
+            ("WAVES", waves),
+        ],
+        grid=(blocks * 32 * waves, -(-width // (16 * _NVFP4_COL_TILES * waves)), 1),
+        threadgroup=(32 * waves, 1, 1),
         output_shapes=[(rows, width)],
         output_dtypes=[mx.bfloat16],
     )[0]
