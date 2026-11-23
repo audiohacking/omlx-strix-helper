@@ -589,6 +589,10 @@ __device__ __forceinline__ float ink_e4m3(unsigned b) {
                       : float(m) * 0.001953125f;
   return (b & 0x80u) ? -mag : mag;
 }
+__device__ __forceinline__ float ink_bf16_round(float x) {
+  const unsigned u = __builtin_bit_cast(unsigned, x);
+  return __builtin_bit_cast(float, (u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u);
+}
 __device__ __forceinline__ ink_v16s ink_load16(const unsigned short* p) {
   union { ink_v16s f; ink_v4u u[2]; } c;
   c.u[0] = *reinterpret_cast<const ink_v4u*>(p);
@@ -722,7 +726,25 @@ for (int rt = 0; rt < RT; ++rt) {
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
       const int r = r0 + rt * 16 + 2 * i + half;
-      if (r < end) {
+      if (ACT) {
+        // The softcapped SwiGLU of the interleaved gate (even) and up (odd)
+        // columns, as the activation kernel rounds it: the product to bf16,
+        // times the expert's bf16 tensor scale, to bf16; the up column sits
+        // in the next lane.
+        float y = ink_bf16_round(vals[i]);
+        if (POST) y = ink_bf16_round(y * ink_bf16_round(post[e]));
+        const float other = __shfl_xor(y, 1);
+        if (r < end && !(sub & 1)) {
+          const float g = y, up = other, gcap = caps[0], ucap = caps[1];
+          float out = tanhf(g / gcap) * gcap;
+          const float sg = 1.0f / (1.0f + expf(-fabsf(g)));
+          out = out * (g < 0.0f ? 1.0f - sg : sg);
+          out = out * (tanhf(up / ucap) * ucap);
+          const unsigned u = __builtin_bit_cast(unsigned, out);
+          yb[(size_t)r * (N / 2) + ((og0 + ogi) * 16 + sub) / 2] =
+              (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+        }
+      } else if (r < end) {
         const unsigned u = __builtin_bit_cast(unsigned, vals[i]);
         yb[(size_t)r * N + (og0 + ogi) * 16 + sub] =
             (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
@@ -746,7 +768,7 @@ _NVFP4_WAVES = 8
 def _nvfp4_kernel():
     return mx.fast.cuda_kernel(
         name="omlx_inkling2_nvfp4_experts",
-        input_names=["x", "w", "s", "offsets", "first", "src"],
+        input_names=["x", "w", "s", "offsets", "first", "src", "post", "caps"],
         output_names=["y"],
         source=_NVFP4_EXPERTS,
         header=_NVFP4_HEADER,
@@ -780,14 +802,22 @@ def nvfp4_tile_rows() -> int:
 
 
 def nvfp4_gemm(
-    x: mx.array, packed, experts: mx.array, route=None, rows=None, gather: bool = True
+    x: mx.array,
+    packed,
+    experts: mx.array,
+    route=None,
+    rows=None,
+    gather: bool = True,
+    act=None,
 ) -> mx.array:
     """``x`` [R, K] bf16 rows sorted by expert, each times its expert of a
     packed NVFP4 bank: [R, N] bf16, before the bank's tensor scale.
 
     ``route``: ``dispatch``'s (offsets, first, source) for ``rows`` sorted
     rows; with ``gather`` ``x`` is the token rows and sorted row r reads row
-    ``source[r]``, else ``x`` is already in expert order.
+    ``source[r]``, else ``x`` is already in expert order. ``act`` (the up
+    bank's tensor scale or None, and the gate and up caps) applies the
+    experts' activation to the interleaved columns: [R, N / 2] bf16.
     """
     codes, scales = packed
     count, tiles = codes.shape[0], codes.shape[1]
@@ -807,8 +837,19 @@ def nvfp4_gemm(
         offsets, first, src = route
     blocks = -(-rows // tile_rows) + count
     width = tiles * 16
+    one = mx.ones((1,), dtype=mx.float32)
+    post, caps = act if act is not None else (None, None)
     return _nvfp4_kernel()(
-        inputs=[mx.contiguous(x), codes, scales, offsets, first, src],
+        inputs=[
+            mx.contiguous(x),
+            codes,
+            scales,
+            offsets,
+            first,
+            src,
+            one if post is None else post,
+            one if caps is None else mx.concatenate([c.reshape(1) for c in caps]),
+        ],
         template=[
             ("K", inputs),
             ("N", width),
@@ -817,10 +858,12 @@ def nvfp4_gemm(
             ("NG", _NVFP4_COL_TILES),
             ("WAVES", waves),
             ("GATHER", int(route is not None and gather)),
+            ("ACT", int(act is not None)),
+            ("POST", int(post is not None)),
         ],
         grid=(blocks * 32 * waves, -(-width // (16 * _NVFP4_COL_TILES * waves)), 1),
         threadgroup=(32 * waves, 1, 1),
-        output_shapes=[(rows, width)],
+        output_shapes=[(rows, width // 2 if act is not None else width)],
         output_dtypes=[mx.bfloat16],
     )[0]
 
@@ -2229,8 +2272,25 @@ def enable(cfg, dtype: mx.Dtype) -> None:
             worst = max(worst, _relative(got, want), _relative(got_window, window))
         _check("convres", worst <= 1e-3, f"relative error {worst:.2e}")
 
+    def check_activation_fused():
+        w = (mx.random.normal((2, 128, 256)) * 0.3).astype(dtype)
+        weight, scales = mx.quantize(w, mode="nvfp4")
+        bank = layers.Experts.Bank(
+            {"b.weight": weight, "b.scales": scales, "b.global_scale": mx.array([2000.0, 3000.0])},
+            "b", layers.expert_spec("nvfp4"),
+        )
+        rows = mx.array([0] * 40 + [1] * 30, dtype=mx.uint32)
+        x = mx.random.normal((70, 256)).astype(dtype)
+        caps = (mx.array(cfg.gate_cap, dtype=mx.float32), mx.array(cfg.up_cap, dtype=mx.float32))
+        packed = nvfp4_pack(bank)
+        y = nvfp4_gemm(x, packed, rows)
+        want = activation(y, rows, bank.post, caps)
+        got = nvfp4_gemm(x, packed, rows, act=(bank.post, caps))
+        _check("actfuse", mx.array_equal(got, want).item(), "differs from the activation kernel")
+
     if _rocm():
         _guarded("nvfp4", check_nvfp4)
+        _guarded("actfuse", check_activation_fused)
         _guarded("convres", check_conv_residual)
         _guarded("mixnorm", check_mix_fused)
         _guarded("dispatch", check_dispatch)

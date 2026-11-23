@@ -534,8 +534,14 @@ class Experts:
             inds, weights, self.cfg.experts, self.w2.post
         )
         route, count = (offsets, first, source), source.shape[0]
-        y = kernels.nvfp4_gemm(rows, (self.w13.weight, self.w13.scales), None, route, count)
-        act = self.activation(y, experts)
+        up = (self.w13.weight, self.w13.scales)
+        if kernels.enabled("actfuse") and kernels.enabled("activation"):
+            # The up GEMM applies the activation as it stores.
+            act = kernels.nvfp4_gemm(
+                rows, up, None, route, count, act=(self.w13.post, self.caps)
+            )
+        else:
+            act = self.activation(kernels.nvfp4_gemm(rows, up, None, route, count), experts)
         # The down GEMM's rows are already in expert order.
         down = kernels.nvfp4_gemm(
             act, (self.w2.weight, self.w2.scales), None, route, count, gather=False
