@@ -31,8 +31,61 @@ _AFFINE_BITS = (2, 3, 4, 8)
 _on: set[str] = set()
 
 
+def _rocm() -> bool:
+    """Whether this build runs ``mx.fast.cuda_kernel`` on the HIP JIT."""
+    if mx.cuda.is_available():
+        return False
+    from ..qwen3_5 import kernels as shared
+
+    return shared.hip_jit()
+
+
 def available() -> bool:
-    return mx.cuda.is_available()
+    return mx.cuda.is_available() or _rocm()
+
+
+# The CUDA names these kernels use, on HIP. bf16 rounds to nearest even both
+# ways; gfx1151 waves are 32 lanes, as CUDA warps are.
+_HIP_COMPAT = """
+#define __nv_bfloat16 hip_bfloat16
+__device__ __forceinline__ float __bfloat162float(hip_bfloat16 x) { return static_cast<float>(x); }
+__device__ __forceinline__ hip_bfloat16 __float2bfloat16_rn(float x) { return hip_bfloat16(x); }
+#define __shfl_xor_sync(mask, value, offset) __shfl_xor(value, offset)
+#ifndef INFINITY
+#define INFINITY __builtin_inff()
+#endif
+"""
+# The float32 Tanh and Sigmoid of MLX's ROCm unary ops, which the JIT cannot
+# include: the activation matches the plain ops only with these.
+_HIP_UNARY = """
+namespace mlx::core::cu {
+struct Tanh {
+  __device__ float operator()(float x) { return ::tanhf(x); }
+};
+struct Sigmoid {
+  __device__ float operator()(float x) {
+    const float y = 1.0f / (1.0f + expf(-fabsf(x)));
+    return x < 0.0f ? 1.0f - y : y;
+  }
+};
+}  // namespace mlx::core::cu
+"""
+# Kernels with CUDA-only code (tensor-core assembly) or from other families'
+# CUDA modules: they stay on plain ops on ROCm.
+_CUDA_ONLY = ("attention", "router_logits", "weighted_sum", "experts")
+
+
+def _cuda_kernel(**kwargs):
+    """``mx.fast.cuda_kernel`` with the CUDA headers mapped for HIP on ROCm."""
+    if _rocm():
+        header = kwargs.get("header", "")
+        header = "\n".join(
+            _HIP_UNARY if "device/unary_ops.cuh" in line else line
+            for line in header.splitlines()
+            if not line.startswith("#include <cuda")
+        )
+        kwargs["header"] = _HIP_COMPAT + header + "\n"
+    return mx.fast.cuda_kernel(**kwargs)
 
 
 def enabled(name: str) -> bool:
@@ -235,7 +288,7 @@ for (int n = 0; n < D / 8; ++n) {
 
 @functools.cache
 def _attention_kernel():
-    return mx.fast.cuda_kernel(
+    return _cuda_kernel(
         name="omlx_inkling2_attention",
         input_names=["q", "k", "v", "rel", "sink", "dims", "scale"],
         output_names=["out"],
@@ -348,7 +401,7 @@ for (int c = tid; c < H; c += TG) {
 def _mix_kernel(sources: int, queries: int):
     names = [f"b{i}" for i in range(sources - 1)] + ["p"]
     loads = " ".join(f"s[{i}] = {n}[base + c];" for i, n in enumerate(names))
-    return mx.fast.cuda_kernel(
+    return _cuda_kernel(
         name=f"omlx_inkling2_mix_{sources}_{queries}",
         input_names=[*names, "query", "scale"],
         output_names=["out"],
@@ -429,7 +482,7 @@ if (lane == 0) {
 
 @functools.cache
 def _route_kernel():
-    return mx.fast.cuda_kernel(
+    return _cuda_kernel(
         name="omlx_inkling2_route",
         input_names=["logits", "bias", "route_scale", "rows"],
         output_names=["inds", "weights"],
@@ -494,7 +547,7 @@ _ROUTER_ROWS = 4
 
 @functools.cache
 def _router_kernel(shared: int):
-    return mx.fast.cuda_kernel(
+    return _cuda_kernel(
         name="omlx_inkling2_router",
         input_names=["x", "w", "runs"],
         output_names=["out"],
@@ -550,7 +603,7 @@ act[id] = __float2bfloat16_rn(out);
 
 @functools.cache
 def _activation_kernel():
-    return mx.fast.cuda_kernel(
+    return _cuda_kernel(
         name="omlx_inkling2_activation",
         input_names=["y", "experts", "post", "caps"],
         output_names=["act"],
@@ -621,7 +674,7 @@ def static_conv(x, w, state, scale: float):
     if kernel is None:
         # A kernel object compiles for the dtypes of its first call only.
         names = "_".join(str(d).rsplit(".", 1)[-1] for d in key)
-        kernel = _CONV_KERNELS[key] = mx.fast.cuda_kernel(
+        kernel = _CONV_KERNELS[key] = _cuda_kernel(
             name=f"omlx_inkling2_conv_{names}",
             input_names=["x", "w", "state", "scale"],
             output_names=["y", "window"],
@@ -682,6 +735,18 @@ def _relative(got: mx.array, want: mx.array) -> float:
     return (mx.linalg.norm(a - b) / mx.maximum(mx.linalg.norm(b), 1e-30)).item()
 
 
+def _guarded(name: str, check) -> None:
+    """Run one kernel's self-check; on ROCm a CUDA-only kernel is skipped and
+    a kernel that fails to build stays off."""
+    if _rocm() and name.split(":")[0] in _CUDA_ONLY:
+        return
+    try:
+        check()
+    except Exception as error:  # noqa: BLE001 - a build or launch failure
+        _on.discard(name)
+        logger.warning("Inkling 2 %s kernel failed (%s); using plain ops", name, error)
+
+
 def _check(name: str, ok: bool, detail: str) -> None:
     if ok:
         _on.add(name)
@@ -699,83 +764,93 @@ def enable(cfg, dtype: mx.Dtype) -> None:
         return
     _on.clear()
     mx.random.seed(0)
-    # Attention: a sliding and a full layer, queries past the first key tile.
-    heads, kv, dim = cfg.swa_heads, cfg.swa_kv_heads, cfg.swa_head_dim
-    worst = 0.0
-    for window, extent, length, total in (
-        (cfg.window, cfg.window, 150, 150 + cfg.window),
-        (0, cfg.rel_extent, 150, 400),
-    ):
-        q = (mx.random.normal((1, length, heads, dim)) * 0.15).astype(dtype)
-        k = (mx.random.normal((1, kv, total, dim)) * 0.15).astype(dtype)
-        v = mx.random.normal((1, kv, total, dim)).astype(dtype)
-        rel = (mx.random.normal((1, length, heads, extent)) * 0.5).astype(dtype)
-        sink = mx.random.normal((1, length, heads)).astype(dtype)
-        got = attention(q, k, v, rel, sink, dim**-0.5, window)
-        want = layers.masked_attention(
-            q.transpose(0, 2, 1, 3), k, v, rel, sink, dim**-0.5, window
-        ).transpose(0, 2, 1, 3)
-        worst = max(worst, _relative(got, want))
-    _check("attention", worst <= 1e-2, f"relative error {worst:.2e}")
-    # Depth mix: a full layer's three queries over every block.
-    blocks = [
-        layers.unit_rms(mx.random.normal((1, 5, cfg.hidden)))
-        for _ in range(MIX_SOURCES - 1)
-    ]
-    partial = layers.unit_rms(mx.random.normal((1, 5, cfg.hidden)))
-    query = mx.random.normal((3, cfg.hidden)) * 0.05
-    scale = cfg.hidden**-0.5
-    src = mx.stack([*blocks, partial], axis=-2)
-    weights = mx.softmax((src @ query.T) * scale, axis=-2, precise=True)
-    error = _relative(
-        mix(blocks, partial, query, scale), weights.swapaxes(-1, -2) @ src
-    )
-    _check("mix", error <= 1e-5, f"relative error {error:.2e}")
-    # Router: the same experts in the same order and the same weights.
-    logits = mx.random.normal((64, cfg.experts)) * 2
-    bias = mx.random.normal((cfg.experts,)) * 0.05
-    inds, w = route_topk(logits, bias, cfg.top_k, cfg.route_scale)
-    scores = mx.sigmoid(logits)
-    order = mx.argsort(-(scores + bias), axis=-1)[:, : cfg.top_k]
-    want_w = mx.take_along_axis(scores, order, axis=-1)
-    want_w = want_w / (mx.sum(want_w, axis=-1, keepdims=True) + 1e-20) * cfg.route_scale
-    same = mx.array_equal(inds, order.astype(mx.uint32)).item()
-    error = _relative(w, want_w)
-    _check("route", same and error <= 1e-6, f"same={same}, error {error:.2e}")
-    # Router logits: the MiniMax kernel's sums, a few rows per block.
-    x = mx.random.normal((70, cfg.hidden)).astype(dtype)
-    columns = mx.random.normal((cfg.hidden, cfg.experts)) * 0.02
-    same = mx.array_equal(router_logits(x, columns), minimax.router(x, columns))
-    _check("router_logits", same.item(), "not equal to the MiniMax kernel")
-    # Convs and the expert activation: equal to the plain ops.
-    same = True
-    for channels in (cfg.hidden, cfg.kv_heads * cfg.head_dim):
-        x = mx.random.normal((1, 37, channels)).astype(dtype)
-        w = (mx.random.normal((channels, cfg.conv_k)) * 0.3).astype(dtype)
-        state = mx.random.normal((1, cfg.conv_k - 1, channels))
-        got = static_conv(x, w, state, 0.4472)
-        want = layers.plain_static_conv(x, w, state, 0.4472)
-        same = same and all(mx.array_equal(a, b).item() for a, b in zip(got, want))
-    _check("conv", same, "not equal to the plain ops")
-    experts = layers.Experts.__new__(layers.Experts)
-    experts.caps = (
-        mx.array(cfg.gate_cap, dtype=mx.float32),
-        mx.array(cfg.up_cap, dtype=mx.float32),
-    )
-    experts.w13 = type("Bank", (), {})()
-    experts.w13.post = mx.random.uniform(0.001, 0.02, (cfg.experts,))
-    y = (mx.random.normal((70, 2 * cfg.inter)) * 3).astype(dtype)
-    picked = mx.random.randint(0, cfg.experts, (70,)).astype(mx.uint32)
-    got = activation(y, picked, experts.w13.post, experts.caps)
-    want = experts.plain_activation(y, picked)
-    _check("activation", mx.array_equal(got, want).item(), "not equal to plain ops")
-    # Expert GEMMs: each carrier against MLX's gather_qmm, which multiplies
-    # with the weights the host's does (mx.dequantize of 3-bit codes differs).
-    rows = mx.array([0] * 70 + [1] * 60, dtype=mx.uint32)
-    x = mx.random.normal((130, 256)).astype(dtype)
-    carriers = [{"mode": m} for m in _FORMATS]
-    carriers += [{"mode": "affine", "bits": b, "group_size": 64} for b in _AFFINE_BITS]
-    for spec in carriers:
+
+    def check_attention():
+        # A sliding and a full layer, queries past the first key tile.
+        heads, kv, dim = cfg.swa_heads, cfg.swa_kv_heads, cfg.swa_head_dim
+        worst = 0.0
+        for window, extent, length, total in (
+            (cfg.window, cfg.window, 150, 150 + cfg.window),
+            (0, cfg.rel_extent, 150, 400),
+        ):
+            q = (mx.random.normal((1, length, heads, dim)) * 0.15).astype(dtype)
+            k = (mx.random.normal((1, kv, total, dim)) * 0.15).astype(dtype)
+            v = mx.random.normal((1, kv, total, dim)).astype(dtype)
+            rel = (mx.random.normal((1, length, heads, extent)) * 0.5).astype(dtype)
+            sink = mx.random.normal((1, length, heads)).astype(dtype)
+            got = attention(q, k, v, rel, sink, dim**-0.5, window)
+            want = layers.masked_attention(
+                q.transpose(0, 2, 1, 3), k, v, rel, sink, dim**-0.5, window
+            ).transpose(0, 2, 1, 3)
+            worst = max(worst, _relative(got, want))
+        _check("attention", worst <= 1e-2, f"relative error {worst:.2e}")
+
+    def check_mix():
+        # A full layer's three queries over every block.
+        blocks = [
+            layers.unit_rms(mx.random.normal((1, 5, cfg.hidden)))
+            for _ in range(MIX_SOURCES - 1)
+        ]
+        partial = layers.unit_rms(mx.random.normal((1, 5, cfg.hidden)))
+        query = mx.random.normal((3, cfg.hidden)) * 0.05
+        scale = cfg.hidden**-0.5
+        src = mx.stack([*blocks, partial], axis=-2)
+        weights = mx.softmax((src @ query.T) * scale, axis=-2, precise=True)
+        error = _relative(
+            mix(blocks, partial, query, scale), weights.swapaxes(-1, -2) @ src
+        )
+        _check("mix", error <= 1e-5, f"relative error {error:.2e}")
+
+    def check_route():
+        # The same experts in the same order and the same weights.
+        logits = mx.random.normal((64, cfg.experts)) * 2
+        bias = mx.random.normal((cfg.experts,)) * 0.05
+        inds, w = route_topk(logits, bias, cfg.top_k, cfg.route_scale)
+        scores = mx.sigmoid(logits)
+        order = mx.argsort(-(scores + bias), axis=-1)[:, : cfg.top_k]
+        want_w = mx.take_along_axis(scores, order, axis=-1)
+        want_w = want_w / (mx.sum(want_w, axis=-1, keepdims=True) + 1e-20) * cfg.route_scale
+        same = mx.array_equal(inds, order.astype(mx.uint32)).item()
+        error = _relative(w, want_w)
+        _check("route", same and error <= 1e-6, f"same={same}, error {error:.2e}")
+
+    def check_router_logits():
+        # The MiniMax kernel's sums, a few rows per block.
+        x = mx.random.normal((70, cfg.hidden)).astype(dtype)
+        columns = mx.random.normal((cfg.hidden, cfg.experts)) * 0.02
+        same = mx.array_equal(router_logits(x, columns), minimax.router(x, columns))
+        _check("router_logits", same.item(), "not equal to the MiniMax kernel")
+
+    def check_conv():
+        same = True
+        for channels in (cfg.hidden, cfg.kv_heads * cfg.head_dim):
+            x = mx.random.normal((1, 37, channels)).astype(dtype)
+            w = (mx.random.normal((channels, cfg.conv_k)) * 0.3).astype(dtype)
+            state = mx.random.normal((1, cfg.conv_k - 1, channels))
+            got = static_conv(x, w, state, 0.4472)
+            want = layers.plain_static_conv(x, w, state, 0.4472)
+            same = same and all(mx.array_equal(a, b).item() for a, b in zip(got, want))
+        _check("conv", same, "not equal to the plain ops")
+
+    def check_activation():
+        experts = layers.Experts.__new__(layers.Experts)
+        experts.caps = (
+            mx.array(cfg.gate_cap, dtype=mx.float32),
+            mx.array(cfg.up_cap, dtype=mx.float32),
+        )
+        experts.w13 = type("Bank", (), {})()
+        experts.w13.post = mx.random.uniform(0.001, 0.02, (cfg.experts,))
+        y = (mx.random.normal((70, 2 * cfg.inter)) * 3).astype(dtype)
+        picked = mx.random.randint(0, cfg.experts, (70,)).astype(mx.uint32)
+        got = activation(y, picked, experts.w13.post, experts.caps)
+        want = experts.plain_activation(y, picked)
+        _check("activation", mx.array_equal(got, want).item(), "not equal to plain ops")
+
+    def check_experts(spec):
+        # Each carrier against MLX's gather_qmm, which multiplies with the
+        # weights the host's does (mx.dequantize of 3-bit codes differs).
+        rows = mx.array([0] * 70 + [1] * 60, dtype=mx.uint32)
+        x = mx.random.normal((130, 256)).astype(dtype)
         # BF16 weights, so affine scales and biases are BF16 as checkpoints hold them.
         w = (mx.random.normal((2, 128, 256)) * 0.05).astype(dtype)
         weight, scales, *biases = mx.quantize(w, **spec)
@@ -787,8 +862,9 @@ def enable(cfg, dtype: mx.Dtype) -> None:
         want = bank(x[:, None], rows)[:, 0]
         error = _relative(gather(x, bank, rows), want)
         _check(f"experts:{_format(bank)}", error <= 1e-3, f"relative error {error:.2e}")
-    # The weighted sum of each token's expert rows, a thread per 8 columns.
-    if cfg.hidden <= 8192 and cfg.hidden % 8 == 0:
+
+    def check_weighted_sum():
+        # The weighted sum of each token's expert rows, a thread per 8 columns.
         down = mx.random.normal((70 * cfg.top_k, cfg.hidden)).astype(dtype)
         inverse = mx.random.permutation(70 * cfg.top_k).astype(mx.uint32)
         weights = mx.random.uniform(0.1, 2.0, (70, cfg.top_k))
@@ -796,3 +872,17 @@ def enable(cfg, dtype: mx.Dtype) -> None:
         want = mx.sum(want * weights[..., None], axis=-2).astype(dtype)
         error = _relative(weighted_sum(down, inverse, weights), want)
         _check("weighted_sum", error <= 1e-3, f"relative error {error:.2e}")
+
+    _guarded("attention", check_attention)
+    _guarded("mix", check_mix)
+    _guarded("route", check_route)
+    _guarded("router_logits", check_router_logits)
+    _guarded("conv", check_conv)
+    _guarded("activation", check_activation)
+    carriers = [{"mode": m} for m in _FORMATS]
+    carriers += [{"mode": "affine", "bits": b, "group_size": 64} for b in _AFFINE_BITS]
+    for spec in carriers:
+        name = spec["mode"] if spec["mode"] != "affine" else f"affine{spec['bits']}"
+        _guarded(f"experts:{name}", lambda spec=spec: check_experts(spec))
+    if cfg.hidden <= 8192 and cfg.hidden % 8 == 0:
+        _guarded("weighted_sum", check_weighted_sum)
