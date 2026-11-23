@@ -287,6 +287,10 @@ class Supervisor:
                 # MLX names a compiled kernel by its source only, so a cache
                 # shared across MLX builds hands one the kernels of another.
                 "MLX_PTX_CACHE_DIR": str(self._kernel_cache()),
+                # ROCm compiles mx.fast.cuda_kernel sources through comgr; its
+                # cache goes with the state too, so a recreated container
+                # (an image update) does not compile every kernel again.
+                "AMD_COMGR_CACHE_DIR": str(self.run_dir.parent / "cache" / "comgr"),
                 # FP32 products pick sparse-attention blocks; TF32 would
                 # change which blocks win.
                 "MLX_ENABLE_TF32": "0",
