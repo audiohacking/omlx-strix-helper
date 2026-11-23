@@ -624,14 +624,21 @@ const int r0 = offsets[e] + (t - first[e]) * ROWS;
 const int tiles = min(RT, (end - r0 + 15) / 16);
 const unsigned short* xs = reinterpret_cast<const unsigned short*>(x);
 ink_v4u stage[EACH];
+// The x row of each piece this thread loads: with GATHER, sorted row r
+// reads token row src[r], so the rows need no gathered copy.
+size_t xrow[EACH];
+#pragma unroll
+for (int j = 0; j < EACH; ++j) {
+  const int row = min(r0 + (tid + j * THREADS) / (KC / 8), end - 1);
+  xrow[j] = GATHER ? (size_t)src[row] : (size_t)row;
+}
 auto fetch = [&](int c) {
 #pragma unroll
   for (int j = 0; j < EACH; ++j) {
     const int piece = tid + j * THREADS;
     if (piece < PIECES) {
-      const int r = piece / (KC / 8), col = (piece % (KC / 8)) * 8;
-      const int row = min(r0 + r, end - 1);
-      stage[j] = *reinterpret_cast<const ink_v4u*>(xs + (size_t)row * K + c * KC + col);
+      const int col = (piece % (KC / 8)) * 8;
+      stage[j] = *reinterpret_cast<const ink_v4u*>(xs + xrow[j] * K + c * KC + col);
     }
   }
 };
@@ -739,7 +746,7 @@ _NVFP4_WAVES = 8
 def _nvfp4_kernel():
     return mx.fast.cuda_kernel(
         name="omlx_inkling2_nvfp4_experts",
-        input_names=["x", "w", "s", "offsets", "first"],
+        input_names=["x", "w", "s", "offsets", "first", "src"],
         output_names=["y"],
         source=_NVFP4_EXPERTS,
         header=_NVFP4_HEADER,
@@ -767,24 +774,41 @@ def nvfp4_pack(bank) -> tuple[mx.array, mx.array]:
     return codes, mx.contiguous(scales.transpose(0, 1, 3, 2, 4))
 
 
-def nvfp4_gemm(x: mx.array, packed, experts: mx.array) -> mx.array:
+def nvfp4_tile_rows() -> int:
+    """Rows of the expert kernel's row tile: ``dispatch`` lays tiles out."""
+    return 16 * _NVFP4_ROW_TILES
+
+
+def nvfp4_gemm(
+    x: mx.array, packed, experts: mx.array, route=None, rows=None, gather: bool = True
+) -> mx.array:
     """``x`` [R, K] bf16 rows sorted by expert, each times its expert of a
-    packed NVFP4 bank: [R, N] bf16, before the bank's tensor scale."""
+    packed NVFP4 bank: [R, N] bf16, before the bank's tensor scale.
+
+    ``route``: ``dispatch``'s (offsets, first, source) for ``rows`` sorted
+    rows; with ``gather`` ``x`` is the token rows and sorted row r reads row
+    ``source[r]``, else ``x`` is already in expert order.
+    """
     codes, scales = packed
     count, tiles = codes.shape[0], codes.shape[1]
-    rows, inputs = x.shape
+    inputs = x.shape[1]
     waves = _NVFP4_WAVES
-    tile_rows = 16 * _NVFP4_ROW_TILES
-    zero = mx.zeros((1,), dtype=mx.int32)
-    counts = mx.zeros((count,), dtype=mx.int32).at[experts.astype(mx.int32)].add(1)
-    offsets = mx.concatenate([zero, mx.cumsum(counts)])
-    # Each expert's rows in whole tiles; the grid covers the most there can be
-    # without reading the counts back.
-    first = mx.concatenate([zero, mx.cumsum((counts + tile_rows - 1) // tile_rows)])
+    tile_rows = nvfp4_tile_rows()
+    if route is None:
+        rows = x.shape[0]
+        zero = mx.zeros((1,), dtype=mx.int32)
+        counts = mx.zeros((count,), dtype=mx.int32).at[experts.astype(mx.int32)].add(1)
+        offsets = mx.concatenate([zero, mx.cumsum(counts)])
+        # Each expert's rows in whole tiles; the grid covers the most there
+        # can be without reading the counts back.
+        first = mx.concatenate([zero, mx.cumsum((counts + tile_rows - 1) // tile_rows)])
+        src = zero
+    else:
+        offsets, first, src = route
     blocks = -(-rows // tile_rows) + count
     width = tiles * 16
     return _nvfp4_kernel()(
-        inputs=[mx.contiguous(x), codes, scales, offsets, first],
+        inputs=[mx.contiguous(x), codes, scales, offsets, first, src],
         template=[
             ("K", inputs),
             ("N", width),
@@ -792,12 +816,86 @@ def nvfp4_gemm(x: mx.array, packed, experts: mx.array) -> mx.array:
             ("RT", _NVFP4_ROW_TILES),
             ("NG", _NVFP4_COL_TILES),
             ("WAVES", waves),
+            ("GATHER", int(route is not None and gather)),
         ],
         grid=(blocks * 32 * waves, -(-width // (16 * _NVFP4_COL_TILES * waves)), 1),
         threadgroup=(32 * waves, 1, 1),
         output_shapes=[(rows, width)],
         output_dtypes=[mx.bfloat16],
     )[0]
+
+
+# The routed rows of a chunk laid out by expert, in one workgroup: counts in
+# LDS, the expert offsets and row-tile starts, then each (token, slot) entry
+# takes the next row of its expert. Rows of an expert come in any order;
+# every row of the expert GEMMs depends on its own input row only. The
+# weights take the down bank's NVFP4 tensor scale (POST).
+_DISPATCH_HIP = """
+__shared__ int count[E], cursor[E], base[E + 1], tiles[E + 1];
+const int tid = threadIdx.x, n = dims[0];
+for (int e = tid; e < E; e += blockDim.x) {
+  count[e] = 0;
+  cursor[e] = 0;
+}
+__syncthreads();
+for (int i = tid; i < n; i += blockDim.x) atomicAdd(&count[inds[i]], 1);
+__syncthreads();
+if (tid == 0) {
+  int o = 0, f = 0;
+  for (int e = 0; e < E; ++e) {
+    base[e] = o;
+    tiles[e] = f;
+    o += count[e];
+    f += (count[e] + TR - 1) / TR;
+  }
+  base[E] = o;
+  tiles[E] = f;
+}
+__syncthreads();
+for (int e = tid; e <= E; e += blockDim.x) {
+  offsets[e] = base[e];
+  first[e] = tiles[e];
+}
+for (int i = tid; i < n; i += blockDim.x) {
+  const int e = inds[i];
+  const int pos = base[e] + atomicAdd(&cursor[e], 1);
+  source[pos] = i / TOPK;
+  sorted[pos] = e;
+  inverse[i] = pos;
+  scaled[i] = POST ? weights[i] * post[e] : weights[i];
+}
+"""
+
+
+@functools.cache
+def _dispatch_kernel():
+    return mx.fast.cuda_kernel(
+        name="omlx_inkling2_dispatch_hip",
+        input_names=["inds", "weights", "post", "dims"],
+        output_names=["offsets", "first", "source", "sorted", "inverse", "scaled"],
+        source=_DISPATCH_HIP,
+    )
+
+
+def dispatch(inds: mx.array, weights: mx.array, experts: int, post=None):
+    """Routed entries by expert, for the expert kernels: (offsets [E+1],
+    tile starts [E+1], token of each sorted row, expert of each sorted row,
+    sorted row of each entry, weights times ``post`` of their expert)."""
+    tokens, each = inds.shape
+    n = tokens * each
+    return _dispatch_kernel()(
+        inputs=[
+            inds.reshape(-1).astype(mx.int32),
+            weights.reshape(-1).astype(mx.float32),
+            mx.ones((1,), dtype=mx.float32) if post is None else post,
+            mx.array([n], dtype=mx.int32),
+        ],
+        template=[("E", experts), ("TOPK", each), ("TR", nvfp4_tile_rows()), ("POST", int(post is not None))],
+        grid=(1024, 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(experts + 1,), (experts + 1,), (n,), (n,), (n,), (tokens, each)],
+        output_dtypes=[mx.int32, mx.int32, mx.int32, mx.uint32, mx.uint32, mx.float32],
+    )
 
 
 # Keys of a ROCm attention tile, and queries of a workgroup per query head:
@@ -1806,8 +1904,26 @@ def enable(cfg, dtype: mx.Dtype) -> None:
             worst = max(worst, _relative(got, want))
         _check("messages", worst <= 1e-2, f"relative error {worst:.2e}")
 
+    def check_dispatch():
+        inds = mx.random.randint(0, cfg.experts, (300, cfg.top_k)).astype(mx.uint32)
+        weights = mx.random.uniform(0.1, 1.0, (300, cfg.top_k))
+        post = mx.random.uniform(0.5, 2.0, (cfg.experts,))
+        offsets, first, source, sorted_, inverse, scaled = dispatch(inds, weights, cfg.experts, post)
+        flat = inds.reshape(-1)
+        counts = mx.zeros((cfg.experts,), dtype=mx.int32).at[flat.astype(mx.int32)].add(1)
+        tile = nvfp4_tile_rows()
+        ok = mx.array_equal(offsets[1:], mx.cumsum(counts)).item()
+        ok = ok and mx.array_equal(first[1:], mx.cumsum((counts + tile - 1) // tile)).item()
+        ok = ok and mx.array_equal(sorted_[inverse], flat).item()
+        tokens = mx.arange(300 * cfg.top_k) // cfg.top_k
+        ok = ok and mx.array_equal(source[inverse], tokens).item()
+        ok = ok and mx.array_equal(mx.sort(inverse), mx.arange(300 * cfg.top_k)).item()
+        ok = ok and mx.allclose(scaled, weights * post[inds]).item()
+        _check("dispatch", ok, "the routed rows do not match their entries")
+
     if _rocm():
         _guarded("nvfp4", check_nvfp4)
+        _guarded("dispatch", check_dispatch)
         _guarded("messages", check_messages)
         _guarded("clip", check_clip)
         _guarded("gate", check_gate)

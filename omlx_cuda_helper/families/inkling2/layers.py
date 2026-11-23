@@ -471,8 +471,9 @@ class Experts:
             self.columns,
         ]
 
-    def route(self, x: mx.array) -> tuple[mx.array, mx.array]:
-        """Experts [N, K] and their float32 weights, the down post-scale in."""
+    def route(self, x: mx.array, post: bool = True) -> tuple[mx.array, mx.array]:
+        """Experts [N, K] and their float32 weights, the down post-scale in
+        unless ``post`` is False."""
         cfg = self.cfg
         if kernels.enabled("router_logits") and x.dtype == mx.bfloat16:
             logits = kernels.router_logits(x, self.columns)
@@ -489,7 +490,7 @@ class Experts:
             weights = mx.take_along_axis(scores, inds, axis=-1)
             weights = weights / (mx.sum(weights, axis=-1, keepdims=True) + 1e-20)
             weights = weights * cfg.route_scale
-        if self.w2.post is not None:
+        if post and self.w2.post is not None:
             weights = weights * self.w2.post[inds]
         return inds, weights
 
@@ -511,9 +512,42 @@ class Experts:
         )
         return out.astype(y.dtype)
 
+    def _dispatched(self, rows: mx.array) -> mx.array | None:
+        """The routed experts through ``kernels.dispatch`` on ROCm: one launch
+        lays the rows out by expert, the up GEMM reads the token rows in
+        place. None when a bank or kernel is not there for it."""
+        banks = (self.w13, self.w2)
+        if not (
+            rows.dtype == mx.bfloat16
+            and kernels.enabled("dispatch")
+            and kernels.enabled("nvfp4")
+            and kernels.enabled("weighted_sum")
+            and all(b.packed or kernels.nvfp4_fits(b) for b in banks)
+        ):
+            return None
+        for bank in banks:
+            if not bank.packed:
+                bank.weight, bank.scales = kernels.nvfp4_pack(bank)
+                bank.packed = True
+        inds, weights = self.route(rows, post=False)
+        offsets, first, source, experts, inverse, scaled = kernels.dispatch(
+            inds, weights, self.cfg.experts, self.w2.post
+        )
+        route, count = (offsets, first, source), source.shape[0]
+        y = kernels.nvfp4_gemm(rows, (self.w13.weight, self.w13.scales), None, route, count)
+        act = self.activation(y, experts)
+        # The down GEMM's rows are already in expert order.
+        down = kernels.nvfp4_gemm(
+            act, (self.w2.weight, self.w2.scales), None, route, count, gather=False
+        )
+        return kernels.weighted_sum(down, inverse, scaled)
+
     def __call__(self, x: mx.array) -> mx.array:
         shape = x.shape
         rows = x.reshape(-1, shape[-1])
+        out = self._dispatched(rows)
+        if out is not None:
+            return out.reshape(shape)
         inds, weights = self.route(rows)
         each = inds.shape[-1]
         flat = inds.reshape(-1)
