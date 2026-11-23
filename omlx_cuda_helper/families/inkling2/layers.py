@@ -263,6 +263,26 @@ def mix(blocks: list, partial: mx.array, query: mx.array) -> mx.array:
     return w.swapaxes(-1, -2) @ src
 
 
+def _bias_band(rel: mx.array, c: int, near: int) -> mx.array:
+    """``rel[..., i, clip(c + i - j, 0, r - 1)]`` for ``j < near``, where
+    ``0 <= c + i - j < r``; other entries are left to the caller's mask.
+
+    The values move into place with pads and reshapes (row ``i`` shifted
+    right by ``i``), not a gather: this build's gather over a 2048-row block
+    of 24 heads took 0.4 s a layer.
+    """
+    *lead, n, r = rel.shape
+    flipped = rel[..., ::-1]
+    # Row i of the padded rows, flattened and cut at width r + n, lands i
+    # columns to the right: column i + u holds flipped[i, u] = rel[i, r-1-u].
+    padded = mx.concatenate([flipped, mx.zeros((*lead, n, n + 1), rel.dtype)], axis=-1)
+    flat = padded.reshape(*lead, n * (r + n + 1))[..., : n * (r + n)]
+    shifted = flat.reshape(*lead, n, r + n)
+    # Key column j has distance c + i - j, so it sits at r - 1 - c + j.
+    start = r - 1 - c
+    return shifted[..., start : start + near]
+
+
 def masked_attention(q, k, v, rel, sink, scale, window):
     """The plain attention: SDPA over an additive mask that carries the bias
     band and a zero key/value row for the sink. q [1, Hq, L, D], k/v
@@ -287,8 +307,7 @@ def masked_attention(q, k, v, rel, sink, scale, window):
         near = hi - f
         dist = (a0 - f) + mx.arange(nq)[:, None] - mx.arange(near)[None, :]
         relq = rel[:, i0:i1].transpose(0, 2, 1, 3)
-        gidx = mx.broadcast_to(mx.clip(dist, 0, r - 1), (b, hq, nq, near))
-        bias = mx.take_along_axis(relq, gidx, axis=-1)
+        bias = _bias_band(relq, a0 - f, near)
         vis = dist >= 0
         if window:
             vis = vis & (dist < window)
