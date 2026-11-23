@@ -70,9 +70,9 @@ struct Sigmoid {
 };
 }  // namespace mlx::core::cu
 """
-# Kernels with CUDA-only code (tensor-core assembly) or from other families'
-# CUDA modules: they stay on plain ops on ROCm.
-_CUDA_ONLY = ("attention", "router_logits", "weighted_sum", "experts")
+# Kernels from other families' CUDA modules: they stay on plain ops on ROCm.
+# Attention has its own RDNA 3 kernel there.
+_CUDA_ONLY = ("router_logits", "weighted_sum", "experts")
 
 
 def _cuda_kernel(**kwargs):
@@ -286,6 +286,177 @@ for (int n = 0; n < D / 8; ++n) {
 """
 
 
+# The same attention on RDNA 3 WMMA (wave32, fp16 in, float32 out), for ROCm.
+# A block runs 64 queries of one head in four waves over 32-key tiles staged in
+# LDS as fp16, keys row by row and values transposed. Scores are taken
+# transposed, keys as rows and queries as columns, so a lane owns one query
+# and 8 of the 16 keys of a group; the other 8 sit in the lane 16 apart. The
+# value sums are taken transposed too (dims as rows), so a lane's
+# accumulators all belong to its own query. Softmax, sink, bias band and
+# fp16 staging follow the CUDA kernel above.
+_ATTENTION_HIP_HEADER = """
+#ifndef INFINITY
+#define INFINITY __builtin_inff()
+#endif
+typedef _Float16 ink_v16h __attribute__((ext_vector_type(16)));
+typedef float ink_v8f __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ ink_v8f ink_wmma(ink_v16h a, ink_v16h b, ink_v8f c) {
+  return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+}
+__device__ __forceinline__ float ink_bf(unsigned short bits) {
+  return __builtin_bit_cast(float, unsigned(bits) << 16);
+}
+"""
+_ATTENTION_HIP = """
+constexpr int BQ = 64, BK = 32, LDK = D + 8, LDV = BK + 8;
+constexpr float LOG2E = 1.4426950408889634f;
+__shared__ __attribute__((aligned(16))) _Float16 ks[BK * LDK];
+__shared__ __attribute__((aligned(16))) _Float16 vt[D * LDV];
+const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+const int sub = lane & 15, half = lane >> 4;
+const int h = blockIdx.y, hk = h / (HQ / HKV);
+const int L = dims[0], S = dims[1];
+const int q0 = blockIdx.x * BQ;
+const int qrow = q0 + wave * 16 + sub;
+const bool qlive = qrow < L;
+const int a = S - L + qrow;
+const float qscale = scale[0] * LOG2E;
+const unsigned short* qb = reinterpret_cast<const unsigned short*>(q);
+const unsigned short* kb = reinterpret_cast<const unsigned short*>(k);
+const unsigned short* vb = reinterpret_cast<const unsigned short*>(v);
+const unsigned short* rb = reinterpret_cast<const unsigned short*>(rel);
+
+// This lane's query, 16 dims a step, in fp16.
+ink_v16h qf[D / 16];
+#pragma unroll
+for (int s16 = 0; s16 < D / 16; ++s16) {
+#pragma unroll
+  for (int e = 0; e < 16; ++e)
+    qf[s16][e] = qlive ? (_Float16)ink_bf(qb[((size_t)qrow * HQ + h) * D + s16 * 16 + e]) : (_Float16)0.0f;
+}
+ink_v8f o[D / 16];
+#pragma unroll
+for (int t = 0; t < D / 16; ++t) o[t] = (ink_v8f){};
+float m = qlive ? sink[(size_t)qrow * HQ + h] * LOG2E : 0.f;
+float l = 1.f;
+const unsigned short* relq = rb + ((size_t)(qlive ? qrow : 0) * HQ + h) * R;
+
+const int a_first = S - L + q0;
+const int a_last = S - L + min(q0 + BQ, L) - 1;
+const int lo = WINDOW > 0 ? max(0, a_first - WINDOW + 1) : 0;
+const int k_begin = (lo / 16) * 16;
+const int w_first = S - L + q0 + wave * 16;
+const int w_last = min(w_first + 15, S - 1);
+const bool wave_on = q0 + wave * 16 < L;
+const unsigned short* kbase = kb + (size_t)hk * S * D;
+const unsigned short* vbase = vb + (size_t)hk * S * D;
+
+for (int k0 = k_begin; k0 <= a_last; k0 += BK) {
+  __syncthreads();
+#pragma unroll
+  for (int i = 0; i < (BK * D / 8) / 128; ++i) {
+    const int c = tid + i * 128;
+    const int row = c / (D / 8), col = (c % (D / 8)) * 8;
+    const int key = k0 + row;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const float kv = key < S ? ink_bf(kbase[(size_t)key * D + col + j]) : 0.f;
+      const float vv = key < S ? ink_bf(vbase[(size_t)key * D + col + j]) : 0.f;
+      ks[row * LDK + col + j] = (_Float16)kv;
+      vt[(col + j) * LDV + row] = (_Float16)vv;
+    }
+  }
+  __syncthreads();
+  if (!wave_on) continue;
+#pragma unroll
+  for (int g = 0; g < BK / 16; ++g) {
+    const int g0 = k0 + g * 16;
+    if (g0 > w_last) break;
+    if (WINDOW > 0 && g0 + 15 < w_first - WINDOW + 1) continue;
+    ink_v8f s = (ink_v8f){};
+    const _Float16* kr = ks + (g * 16 + sub) * LDK;
+#pragma unroll
+    for (int s16 = 0; s16 < D / 16; ++s16) {
+      ink_v16h kf;
+#pragma unroll
+      for (int e = 0; e < 16; ++e) kf[e] = kr[s16 * 16 + e];
+      s = ink_wmma(kf, qf[s16], s);
+    }
+    // Element i: key g0 + 2 i + half of this lane's query.
+    float x[8];
+    float mx = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int key = g0 + 2 * i + half;
+      const int d = a - key;
+      const bool vis = qlive && key < S && d >= 0 && (WINDOW == 0 || d < WINDOW);
+      float xi = s[i] * qscale;
+      if (vis) {
+        if (d < R) xi += ink_bf(relq[d]) * LOG2E;
+      } else {
+        xi = -INFINITY;
+      }
+      x[i] = xi;
+      mx = fmaxf(mx, xi);
+    }
+    mx = fmaxf(mx, __shfl_xor(mx, 16));
+    const float n = fmaxf(m, mx);
+    const float f = exp2f(m - n);
+    float sum = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      x[i] = exp2f(x[i] - n);
+      sum += x[i];
+    }
+    sum += __shfl_xor(sum, 16);
+    l = l * f + sum;
+    m = n;
+    // The query's 16 weights in key order: 2 i + half here, the rest 16 lanes away.
+    ink_v16h pf;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float other = __shfl_xor(x[i], 16);
+      pf[2 * i + half] = (_Float16)x[i];
+      pf[2 * i + 1 - half] = (_Float16)other;
+    }
+#pragma unroll
+    for (int t = 0; t < D / 16; ++t) {
+      o[t] = o[t] * f;
+      ink_v16h vf;
+      const _Float16* vr = vt + (t * 16 + sub) * LDV + g * 16;
+#pragma unroll
+      for (int e = 0; e < 16; ++e) vf[e] = vr[e];
+      o[t] = ink_wmma(vf, pf, o[t]);
+    }
+  }
+}
+if (qlive) {
+  const float inv = 1.f / l;
+  unsigned short* ob = reinterpret_cast<unsigned short*>(out) + ((size_t)qrow * HQ + h) * D;
+#pragma unroll
+  for (int t = 0; t < D / 16; ++t) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float y = o[t][i] * inv;
+      const unsigned u = __builtin_bit_cast(unsigned, y);
+      ob[t * 16 + 2 * i + half] = (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    }
+  }
+}
+"""
+
+
+@functools.cache
+def _attention_hip_kernel():
+    return mx.fast.cuda_kernel(
+        name="omlx_inkling2_attention_hip",
+        input_names=["q", "k", "v", "rel", "sink", "dims", "scale"],
+        output_names=["out"],
+        source=_ATTENTION_HIP,
+        header=_ATTENTION_HIP_HEADER,
+    )
+
+
 @functools.cache
 def _attention_kernel():
     return _cuda_kernel(
@@ -308,13 +479,16 @@ def attention(q, keys, values, rel, sink, scale: float, window: int) -> mx.array
     sink [1, L, Hq]. Returns [1, L, Hq, D]."""
     _, length, heads, dim = q.shape
     kv_heads, total = keys.shape[1], keys.shape[2]
-    out = _attention_kernel()(
+    # A view of the leading axis: x[0] runs a gather on ROCm.
+    lead = functools.partial(mx.squeeze, axis=0)
+    kernel = _attention_hip_kernel() if _rocm() else _attention_kernel()
+    out = kernel(
         inputs=[
-            mx.contiguous(q[0]),
-            mx.contiguous(keys[0]),
-            mx.contiguous(values[0]),
-            mx.contiguous(rel[0]),
-            mx.contiguous(sink[0].astype(mx.float32)),
+            mx.contiguous(lead(q)),
+            mx.contiguous(lead(keys)),
+            mx.contiguous(lead(values)),
+            mx.contiguous(lead(rel)),
+            mx.contiguous(lead(sink).astype(mx.float32)),
             mx.array([length, total], dtype=mx.int32),
             mx.array([scale], dtype=mx.float32),
         ],
