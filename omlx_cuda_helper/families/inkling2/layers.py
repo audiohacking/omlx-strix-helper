@@ -263,6 +263,11 @@ def mix(blocks: list, partial: mx.array, query: mx.array) -> mx.array:
     return w.swapaxes(-1, -2) @ src
 
 
+def _lead(x: mx.array) -> mx.array:
+    """``x[0]`` as a view: integer indexing runs a gather on ROCm."""
+    return mx.squeeze(x[:1], axis=0)
+
+
 def mix_messages(x, message, down, gain_forget):
     """Loop controllers: ``(1 - tanh(forget)) * x + tanh(gain) * message``.
 
@@ -769,18 +774,21 @@ class Layer:
             query, down, gain_forget = self.loop
             messages = mix(*bank, query)
         if fused and self.sliding:
-            xq, xk, xv = kernels.mix_messages_normed(
+            normed = kernels.mix_messages_normed(
                 mixed[:, :, :1], messages, 0, 3, self.loop_down16[:3],
                 gain_forget[:3], self.attn_norm, cfg.eps,
             )
+            xq, xk, xv = (_lead(normed[i : i + 1]) for i in range(3))
         elif fused:
             # Each full-layer input has its own norm: one call each.
             xq, xk, xv = (
-                kernels.mix_messages_normed(
-                    mixed[:, :, i : i + 1], messages, i, 1,
-                    self.loop_down16[i : i + 1], gain_forget[i : i + 1],
-                    weight, cfg.eps,
-                )[0]
+                _lead(
+                    kernels.mix_messages_normed(
+                        mixed[:, :, i : i + 1], messages, i, 1,
+                        self.loop_down16[i : i + 1], gain_forget[i : i + 1],
+                        weight, cfg.eps,
+                    )
+                )
                 for i, weight in enumerate(norms)
             )
         elif messages is not None:
@@ -827,10 +835,12 @@ class Layer:
         y = mix(blocks, unit_rms(residual), self.mlp_query)
         if fused:
             _, _, gain_forget = self.loop
-            normed = kernels.mix_messages_normed(
-                y, messages, 3, 1, self.loop_down16[3:], gain_forget[3:],
-                self.mlp_norm, cfg.eps,
-            )[0]
+            normed = _lead(
+                kernels.mix_messages_normed(
+                    y, messages, 3, 1, self.loop_down16[3:], gain_forget[3:],
+                    self.mlp_norm, cfg.eps,
+                )
+            )
         else:
             y = y[:, :, 0]
             if messages is not None:

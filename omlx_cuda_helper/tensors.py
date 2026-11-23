@@ -207,9 +207,14 @@ class Linear:
         slice of a Linear: through those rows of the weight only."""
         if self.rotation is not None:
             return self(x)[..., start:end]
+        if self.quant is None and self.columns:
+            # A column slice of the [in, out] weight is not contiguous, and a
+            # matmul would copy it each call: keep each slice once.
+            held = self.__dict__.setdefault("_slices", {})
+            if (start, end) not in held:
+                held[(start, end)] = mx.contiguous(self.weight[:, start:end])
+            return x @ held[(start, end)]
         if self.quant is None:
-            if self.columns:
-                return x @ self.weight[:, start:end]
             return x @ self.weight[start:end].T
         scales, biases, quant = self.quant
         return mx.quantized_matmul(
