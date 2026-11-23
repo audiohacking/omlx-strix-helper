@@ -371,6 +371,8 @@ class Experts:
             self.biases = w.get(f"{name}.biases")
             global_scale = w.get(f"{name}.global_scale")
             self.quant = quant
+            # True once the codes and scales are held as the ROCm kernel reads them.
+            self.packed = False
             # The NVFP4 tensor scale applies after the product, in float32.
             self.post = None
             if quant["mode"] == "nvfp4":
@@ -391,6 +393,19 @@ class Experts:
         def parameters(self) -> list[mx.array]:
             own = (self.weight, self.scales, self.biases, self.post)
             return [a for a in own if a is not None]
+
+        def product(self, x: mx.array, experts: mx.array) -> mx.array:
+            """Rows [R, K] sorted by expert through their experts: [R, N].
+
+            On ROCm an NVFP4 bank takes the HIP kernel once it passed its
+            check; its codes and scales are then held in the kernel's order.
+            """
+            if kernels.enabled("nvfp4") and (self.packed or kernels.nvfp4_fits(self)):
+                if not self.packed:
+                    self.weight, self.scales = kernels.nvfp4_pack(self)
+                    self.packed = True
+                return kernels.nvfp4_gemm(x, (self.weight, self.scales), experts)
+            return self(x[:, None, :], experts)[:, 0]
 
         def __call__(self, x: mx.array, experts: mx.array) -> mx.array:
             q = self.quant
@@ -484,12 +499,12 @@ class Experts:
         if kernels.covers_bank(self.w13, routed.dtype):
             y = kernels.gather(routed, self.w13, experts)
         else:
-            y = self.w13(routed[:, None, :], experts)[:, 0]
+            y = self.w13.product(routed, experts)
         act = self.activation(y, experts)
         if kernels.covers_bank(self.w2, act.dtype):
             down = kernels.gather(act, self.w2, experts)
         else:
-            down = self.w2(act[:, None, :], experts)[:, 0]
+            down = self.w2.product(act, experts)
         if x.dtype == mx.bfloat16 and kernels.enabled("weighted_sum"):
             out = kernels.weighted_sum(down, inverse, weights)
         else:

@@ -446,6 +446,162 @@ if (qlive) {
 """
 
 
+# NVFP4 experts on RDNA 3 WMMA, for ROCm: rows sorted by expert, one wave a
+# (16-row tile, four 16-column tiles). A group of 16 inputs is one WMMA step
+# of the rows and the E2M1 codes (exact in bf16), times the column's E4M3
+# scale, added in float32; the sum rounds to bf16 once, as gather_qmm's does.
+# The codes are held [E, N / 16, K / 16, 16 columns, 2 words] and the scales
+# [E, N / 16, K / 16, 16 columns], as a wave reads them.
+_NVFP4_HEADER = """
+typedef short ink_v16s __attribute__((ext_vector_type(16)));
+typedef float ink_v8f __attribute__((ext_vector_type(8)));
+typedef unsigned int ink_v4u __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ ink_v8f ink_wmma_bf16(ink_v16s a, ink_v16s b, ink_v8f c) {
+  return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
+}
+// Eight E2M1 codes of a word as bf16, in element order: a magnitude table
+// lookup for the low and high byte of each, the sign, then interleaving.
+__device__ __forceinline__ void ink_fp4_word(unsigned x, unsigned* out) {
+  constexpr unsigned TH_LO = 0x3F3F3F00u, TH_HI = 0x40404040u;
+  constexpr unsigned TL_LO = 0xC0800000u, TL_HI = 0xC0804000u;
+  const unsigned m_even = x & 0x07070707u, m_odd = (x >> 4) & 0x07070707u;
+  const unsigned l_even = __builtin_amdgcn_perm(TL_HI, TL_LO, m_even);
+  const unsigned h_even = __builtin_amdgcn_perm(TH_HI, TH_LO, m_even) | ((x << 4) & 0x80808080u);
+  const unsigned l_odd = __builtin_amdgcn_perm(TL_HI, TL_LO, m_odd);
+  const unsigned h_odd = __builtin_amdgcn_perm(TH_HI, TH_LO, m_odd) | (x & 0x80808080u);
+  // [low, high] of the even codes 0, 2 and 4, 6; then of the odd codes.
+  const unsigned e01 = __builtin_amdgcn_perm(h_even, l_even, 0x05010400u);
+  const unsigned e23 = __builtin_amdgcn_perm(h_even, l_even, 0x07030602u);
+  const unsigned o01 = __builtin_amdgcn_perm(h_odd, l_odd, 0x05010400u);
+  const unsigned o23 = __builtin_amdgcn_perm(h_odd, l_odd, 0x07030602u);
+  out[0] = __builtin_amdgcn_perm(o01, e01, 0x05040100u);
+  out[1] = __builtin_amdgcn_perm(o01, e01, 0x07060302u);
+  out[2] = __builtin_amdgcn_perm(o23, e23, 0x05040100u);
+  out[3] = __builtin_amdgcn_perm(o23, e23, 0x07060302u);
+}
+__device__ __forceinline__ ink_v16s ink_fp4(const unsigned* p) {
+  union { ink_v16s f; unsigned u[8]; } c;
+  ink_fp4_word(p[0], c.u);
+  ink_fp4_word(p[1], c.u + 4);
+  return c.f;
+}
+__device__ __forceinline__ float ink_e4m3(unsigned b) {
+  const unsigned e = (b >> 3) & 15u, m = b & 7u;
+  const float mag = e ? __builtin_bit_cast(float, ((e + 120u) << 23) | (m << 20))
+                      : float(m) * 0.001953125f;
+  return (b & 0x80u) ? -mag : mag;
+}
+__device__ __forceinline__ ink_v16s ink_load16(const unsigned short* p) {
+  union { ink_v16s f; ink_v4u u[2]; } c;
+  c.u[0] = *reinterpret_cast<const ink_v4u*>(p);
+  c.u[1] = *reinterpret_cast<const ink_v4u*>(p + 8);
+  return c.f;
+}
+"""
+_NVFP4_EXPERTS = """
+constexpr int NG = 4;
+constexpr int KS = K / 16;
+const int lane = threadIdx.x, sub = lane & 15, half = lane >> 4;
+const int og0 = blockIdx.y * NG;
+const int e = blockIdx.z;
+const int begin = offsets[e], end = offsets[e + 1];
+const int r0 = begin + blockIdx.x * 16;
+if (og0 >= N / 16 || r0 >= end) return;
+const int row = r0 + sub;
+const int live = row < end ? row : end - 1;
+const unsigned short* xp = reinterpret_cast<const unsigned short*>(x) + (size_t)live * K;
+ink_v8f acc[NG];
+const unsigned* wc[NG];
+const unsigned char* sc[NG];
+#pragma unroll
+for (int ogi = 0; ogi < NG; ++ogi) {
+  acc[ogi] = (ink_v8f){};
+  const size_t tile = size_t(e) * (N / 16) + og0 + ogi;
+  wc[ogi] = w + tile * KS * 32 + sub * 2;
+  sc[ogi] = s + tile * KS * 16 + sub;
+}
+for (int ks = 0; ks < KS; ++ks) {
+  const ink_v16s a = ink_load16(xp + ks * 16);
+#pragma unroll
+  for (int ogi = 0; ogi < NG; ++ogi) {
+    const ink_v8f p = ink_wmma_bf16(a, ink_fp4(wc[ogi] + ks * 32), (ink_v8f){});
+    const float scale = ink_e4m3(sc[ogi][ks * 16]);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc[ogi][i] += scale * p[i];
+  }
+}
+unsigned short* yb = reinterpret_cast<unsigned short*>(y);
+#pragma unroll
+for (int ogi = 0; ogi < NG; ++ogi) {
+  // Element i of the accumulator is row 2 i + half; copied out first, as an
+  // indexed read of the vector inside the guarded loop read element 0 only.
+  float vals[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) vals[i] = acc[ogi][i];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int r = r0 + 2 * i + half;
+    if (r < end) {
+      const unsigned u = __builtin_bit_cast(unsigned, vals[i]);
+      yb[(size_t)r * N + (og0 + ogi) * 16 + sub] =
+          (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    }
+  }
+}
+"""
+
+
+@functools.cache
+def _nvfp4_kernel():
+    return mx.fast.cuda_kernel(
+        name="omlx_inkling2_nvfp4_experts",
+        input_names=["x", "w", "s", "offsets"],
+        output_names=["y"],
+        source=_NVFP4_EXPERTS,
+        header=_NVFP4_HEADER,
+    )
+
+
+def nvfp4_fits(bank) -> bool:
+    """Whether the ROCm NVFP4 expert kernel takes this bank."""
+    weight = bank.weight
+    if bank.quant.get("mode") != "nvfp4" or weight.ndim != 3:
+        return False
+    inputs = weight.shape[2] * 8
+    return weight.shape[1] % 64 == 0 and inputs % 16 == 0
+
+
+def nvfp4_pack(bank) -> tuple[mx.array, mx.array]:
+    """(codes, scales) of an NVFP4 bank in the order the kernel reads them."""
+    count, width, words = bank.weight.shape
+    codes = bank.weight.reshape(count, width // 16, 16, words // 2, 2)
+    codes = mx.contiguous(codes.transpose(0, 1, 3, 2, 4))
+    groups = bank.scales.shape[-1]
+    scales = bank.scales.reshape(count, width // 16, 16, groups)
+    return codes, mx.contiguous(scales.transpose(0, 1, 3, 2))
+
+
+def nvfp4_gemm(x: mx.array, packed, experts: mx.array) -> mx.array:
+    """``x`` [R, K] bf16 rows sorted by expert, each times its expert of a
+    packed NVFP4 bank: [R, N] bf16, before the bank's tensor scale."""
+    codes, scales = packed
+    count, tiles = codes.shape[0], codes.shape[1]
+    rows, inputs = x.shape
+    counts = mx.zeros((count,), dtype=mx.int32).at[experts.astype(mx.int32)].add(1)
+    offsets = mx.concatenate([mx.zeros((1,), dtype=mx.int32), mx.cumsum(counts)])
+    span = int(mx.max(counts).item())
+    blocks = max(1, -(-span // 16))
+    width = tiles * 16
+    return _nvfp4_kernel()(
+        inputs=[mx.contiguous(x), codes, scales, offsets],
+        template=[("K", inputs), ("N", width)],
+        grid=(blocks * 32, width // 64, count),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(rows, width)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+
 @functools.cache
 def _attention_hip_kernel():
     return mx.fast.cuda_kernel(
@@ -1047,6 +1203,21 @@ def enable(cfg, dtype: mx.Dtype) -> None:
         error = _relative(weighted_sum(down, inverse, weights), want)
         _check("weighted_sum", error <= 1e-3, f"relative error {error:.2e}")
 
+    def check_nvfp4():
+        # Two experts, rows of each: the ROCm NVFP4 kernel against gather_qmm.
+        w = (mx.random.normal((2, 128, 256)) * 0.05).astype(dtype)
+        weight, scales = mx.quantize(w, mode="nvfp4")
+        bank = layers.Experts.Bank(
+            {"b.weight": weight, "b.scales": scales}, "b", layers.expert_spec("nvfp4")
+        )
+        rows = mx.array([0] * 40 + [1] * 30, dtype=mx.uint32)
+        x = mx.random.normal((70, 256)).astype(dtype)
+        want = bank(x[:, None], rows)[:, 0]
+        error = _relative(nvfp4_gemm(x, nvfp4_pack(bank), rows), want)
+        _check("nvfp4", error <= 1e-3, f"relative error {error:.2e}")
+
+    if _rocm():
+        _guarded("nvfp4", check_nvfp4)
     _guarded("attention", check_attention)
     _guarded("mix", check_mix)
     _guarded("route", check_route)
