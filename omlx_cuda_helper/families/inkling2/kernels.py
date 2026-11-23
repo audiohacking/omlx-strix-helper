@@ -1516,6 +1516,96 @@ def static_conv(x, w, state, scale: float):
     return y, window
 
 
+# ``layers.static_conv`` for HIP, then (RES) a residual add: one thread per
+# (row, channel) of [state, x]. x is bf16, read at column XOFF of rows XW
+# wide; the taps multiply and add separately in float32 and round to the
+# weight dtype (WB: bf16), add the input and scale, then round to bf16 as the
+# conv's output. RES 1 adds a bf16 residual, RES 2 a float32 one; OUTF keeps
+# the sum in float32, else it rounds to bf16.
+_CONV_HIP = """
+const int L = dims[0];
+const size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+if (id >= (size_t)(L + TAPS - 1) * C) return;
+const int t = id / C, c = id % C;
+const unsigned short* xb = reinterpret_cast<const unsigned short*>(x);
+auto bf = [](unsigned short v) { return __builtin_bit_cast(float, unsigned(v) << 16); };
+auto round = [](float v) {
+  const unsigned u = __builtin_bit_cast(unsigned, v);
+  return __builtin_bit_cast(float, (u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u);
+};
+auto xp = [&](int j) -> float {
+  return j < TAPS - 1 ? state[(size_t)j * C + c] : bf(xb[(size_t)(j - TAPS + 1) * XW + XOFF + c]);
+};
+if (t >= L) {
+  // The last TAPS - 1 rows of [state, x] are the next state.
+  window[(size_t)(t - L) * C + c] = xp(t);
+  return;
+}
+const unsigned short* wb = reinterpret_cast<const unsigned short*>(w);
+auto tap = [&](int j) {
+  return WB ? bf(wb[(size_t)c * TAPS + j]) : reinterpret_cast<const float*>(w)[(size_t)c * TAPS + j];
+};
+float acc = __fmul_rn(tap(0), xp(t));
+#pragma unroll
+for (int j = 1; j < TAPS; ++j) acc = __fadd_rn(acc, __fmul_rn(tap(j), xp(t + j)));
+if (WB) acc = round(acc);
+float o = round(__fmul_rn(__fadd_rn(acc, xp(t + TAPS - 1)), scale[0]));
+if (RES == 1) o = __fadd_rn(bf(reinterpret_cast<const unsigned short*>(residual)[(size_t)t * C + c]), o);
+if (RES == 2) o = __fadd_rn(reinterpret_cast<const float*>(residual)[(size_t)t * C + c], o);
+if (OUTF) {
+  reinterpret_cast<float*>(y)[(size_t)t * C + c] = o;
+} else {
+  reinterpret_cast<unsigned short*>(y)[(size_t)t * C + c] =
+      (unsigned short)(__builtin_bit_cast(unsigned, round(o)) >> 16);
+}
+"""
+
+
+@functools.cache
+def _conv_hip_kernel():
+    return mx.fast.cuda_kernel(
+        name="omlx_inkling2_conv_hip",
+        input_names=["x", "w", "state", "scale", "residual", "dims"],
+        output_names=["y", "window"],
+        source=_CONV_HIP,
+    )
+
+
+def conv_residual(x, w, state, scale: float, *, channels=None, offset=0, residual=None, out_f32=False):
+    """``layers.static_conv`` of bf16 ``x`` [1, L, W] columns ``[offset,
+    offset + channels)`` (all by default), plus ``residual`` (bf16 or float32
+    [1, L, C]) when given: (output [1, L, C], the next state)."""
+    _, length, width = x.shape
+    channels = width if channels is None else channels
+    taps = w.shape[-1]
+    count = (length + taps - 1) * channels
+    res = 0 if residual is None else (1 if residual.dtype == mx.bfloat16 else 2)
+    y, window = _conv_hip_kernel()(
+        inputs=[
+            x,
+            w,
+            state,
+            mx.array([scale], dtype=mx.float32),
+            mx.zeros((1,), dtype=mx.float32) if residual is None else residual,
+            mx.array([length], dtype=mx.int32),
+        ],
+        template=[
+            ("TAPS", taps),
+            ("C", channels),
+            ("XW", width),
+            ("XOFF", offset),
+            ("WB", int(w.dtype == mx.bfloat16)),
+            ("RES", res),
+            ("OUTF", int(out_f32)),
+        ],
+        grid=(-(-count // 256) * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1, length, channels), (1, taps - 1, channels)],
+        output_dtypes=[mx.float32 if out_f32 else mx.bfloat16, mx.float32],
+    )
+    return y, window
+
+
 def _format(bank) -> str | None:
     """The bank's carrier as the expert GEMMs name it, or None."""
     quant = bank.quant
@@ -2117,8 +2207,31 @@ def enable(cfg, dtype: mx.Dtype) -> None:
         worst = max(worst, _relative(plain, layers.mix(blocks, layers.unit_rms(h_n), query)))
         _check("mixnorm", worst <= 1e-2, f"relative error {worst:.2e}")
 
+    def check_conv_residual():
+        channels, taps = cfg.hidden, cfg.conv_k
+        base = mx.random.normal((1, 70, channels + 96)).astype(dtype)
+        w = (mx.random.normal((channels, taps)) * 0.3).astype(dtype)
+        state = mx.random.normal((1, taps - 1, channels))
+        h = mx.random.normal((1, 70, channels)).astype(dtype)
+        r32 = mx.random.normal((1, 70, channels))
+        x = base[..., 32 : 32 + channels]
+        conv, window = layers.plain_static_conv(x, w, state, 0.4)
+        worst = 0.0
+        for residual, out_f32, want in (
+            (None, False, conv),
+            (h, True, h.astype(mx.float32) + conv.astype(mx.float32)),
+            (r32, False, (r32 + conv.astype(mx.float32)).astype(dtype)),
+        ):
+            got, got_window = conv_residual(
+                base, w, state, 0.4, channels=channels, offset=32,
+                residual=residual, out_f32=out_f32,
+            )
+            worst = max(worst, _relative(got, want), _relative(got_window, window))
+        _check("convres", worst <= 1e-3, f"relative error {worst:.2e}")
+
     if _rocm():
         _guarded("nvfp4", check_nvfp4)
+        _guarded("convres", check_conv_residual)
         _guarded("mixnorm", check_mix_fused)
         _guarded("dispatch", check_dispatch)
         _guarded("messages", check_messages)

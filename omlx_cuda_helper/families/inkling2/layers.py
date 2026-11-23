@@ -696,8 +696,18 @@ class Layer:
             proj = self.in_proj(xq)
             q, k, v, r, gate, sink = mx.split(proj, self.cuts, axis=-1)
             at = {"q": (proj, 0), "r": (proj, self.cuts[2]), "gate": (proj, self.cuts[3])}
-            k, ks = static_conv(k, self.k_conv, states[0], self.sconv_scale)
-            v, vs = static_conv(v, self.v_conv, states[1], self.sconv_scale)
+            if kernels.enabled("convres") and proj.dtype == mx.bfloat16:
+                # The convs read k and v in place in the projection.
+                c0, c1 = self.cuts[0], self.cuts[1]
+                k, ks = kernels.conv_residual(
+                    proj, self.k_conv, states[0], self.sconv_scale, channels=self.dkv, offset=c0
+                )
+                v, vs = kernels.conv_residual(
+                    proj, self.v_conv, states[1], self.sconv_scale, channels=self.dkv, offset=c1
+                )
+            else:
+                k, ks = static_conv(k, self.k_conv, states[0], self.sconv_scale)
+                v, vs = static_conv(v, self.v_conv, states[1], self.sconv_scale)
         else:
             proj = self.q_proj(xq)
             q, r, gate, sink = mx.split(proj, self.cuts, axis=-1)
@@ -881,11 +891,19 @@ class Layer:
             c if c is not None else mx.zeros((1, cfg.conv_k - 1, hidden), mx.float32)
             for c in cache.conv[2:]
         ]
-        a, s2 = static_conv(a, self.attn_conv, states[0], self.sconv_scale)
-        if self.boundary:
-            residual = a.astype(mx.float32)
+        convres = kernels.enabled("convres") and a.dtype == mx.bfloat16
+        if convres:
+            # The conv adds h (off a block boundary) and keeps the sum in float32.
+            residual, s2 = kernels.conv_residual(
+                a, self.attn_conv, states[0], self.sconv_scale,
+                residual=None if self.boundary else h, out_f32=True,
+            )
         else:
-            residual = h.astype(mx.float32) + a.astype(mx.float32)
+            a, s2 = static_conv(a, self.attn_conv, states[0], self.sconv_scale)
+            if self.boundary:
+                residual = a.astype(mx.float32)
+            else:
+                residual = h.astype(mx.float32) + a.astype(mx.float32)
         if mixnorm and messages is None:
             out, _ = kernels.mix_fused(blocks, residual, self.mlp_query, [self.mlp_norm], cfg.eps)
             normed = _lead(out)
@@ -912,6 +930,12 @@ class Layer:
                 ).squeeze(0)
             normed = mx.fast.rms_norm(y, self.mlp_norm, cfg.eps).astype(dtype)
         m = self.experts(normed)
+        if convres and m.dtype == mx.bfloat16:
+            h, s3 = kernels.conv_residual(
+                m, self.mlp_conv, states[1], self.sconv_scale, residual=residual
+            )
+            cache.conv[2], cache.conv[3] = s2, s3
+            return h.astype(dtype)
         m, s3 = static_conv(m, self.mlp_conv, states[1], self.sconv_scale)
         cache.conv[2], cache.conv[3] = s2, s3
         return (residual + m.astype(mx.float32)).astype(dtype)
