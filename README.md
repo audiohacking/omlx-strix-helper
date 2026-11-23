@@ -13,7 +13,7 @@ Setup is in [DEMO.md](DEMO.md): find the device, Pair, and Check.
 
 ## Status
 
-Alpha. Qwen3.8 27B and Qwen3.8 Flash-Next have optimized kernels on the Radeon; the other families run on portable ops.
+Alpha. Qwen3.8 27B, Qwen3.8 Flash-Next and Inkling 2 have optimized kernels on the Radeon; the other families run on portable ops.
 
 ## Results
 
@@ -21,8 +21,9 @@ Prefill tok/s on a 64K-token prompt with an M3 Ultra (512 GB), oQ4e checkpoints.
 
 | Model | M3 Ultra alone | + Strix Halo | + DGX Spark | + 2x RTX A6000 |
 | --- | ---: | ---: | ---: | ---: |
-| Qwen3.8 27B | 404 | 831 | 1,062 | 1,879 |
-| Qwen3.8 Flash-Next | 1,376 | 2,187 | 2,715 | 3,928 |
+| Qwen3.8 27B | 404 | 831 | 1,062* | 1,879* |
+| Qwen3.8 Flash-Next | 1,376 | 2,187 | 2,715* | 3,928* |
+| Inkling 2 Mini | 1,398 | 2,468 | — | — |
 
 * The DGX Spark and RTX A6000 figures are from the [oMLX 0.8.0 release](https://github.com/jundot/omlx/releases/tag/v0.8.0), over 2.5 GbE, where the M3 Ultra alone reads 352 (27B) and 1,370 (Flash-Next).
 * The Strix Halo figures are over Thunderbolt.
@@ -37,6 +38,16 @@ M3 Ultra with one Strix Halo, 64 generated tokens, MTP on:
 | Qwen3.8 27B | 65,536 | 831 | 66 |
 | Qwen3.8 Flash-Next | 65,536 | 2,187 | — |
 
+Inkling 2 Mini, 512 generated tokens:
+
+| Prompt | M3 Ultra alone | + Strix Halo | Time to first token | Decode tok/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 8,192 | 1,744 | 2,325 | 4.7 s → 3.5 s | 105 |
+| 32,768 | 1,598 | 2,654 | 20.5 s → 12.3 s | 84 |
+| 65,536 | 1,398 | 2,468 | 46.9 s → 26.6 s | 72 |
+
+Inkling 2 Mini runs its middle layers three times per token. Splitting it inside those repeats needs the [audiohacking/omlx](https://github.com/audiohacking/omlx) fork; stock oMLX does not split this model yet.
+
 ## The cable
 
 **10 Gb, no patch.** A direct 10G cable, or both machines on a 10G switch. The port reports a media speed, so stock oMLX selects it. Use this when you have it.
@@ -49,7 +60,7 @@ After Pair, Check shows the cable in use. 10G reads **10000 Mbit/s** and the bri
 
 ## How it works
 
-The Mac holds the weights, the cache, and generation. For prompts of 2,048 tokens and up, the Halo runs the first K layers of each prompt chunk and returns the hidden state plus the cache rows for those layers; the Mac runs the remaining layers. Both machines work at the same time on different chunks, so the Halo adds speed even when it is slower than the Mac. oMLX picks K from the measured pace of each side, or you can set it per model. Shorter prompts, and prompts with images, stay on the Mac.
+The Mac holds the weights, the cache, and generation. For prompts of 2,048 tokens and up, the Halo runs the first K layers (layer visits, for a model that repeats layers) of each prompt chunk and returns the hidden state plus the cache rows for those layers; the Mac runs the remaining layers. Both machines work at the same time on different chunks, so the Halo adds speed even when it is slower than the Mac. oMLX picks K from the measured pace of each side, or you can set it per model. Shorter prompts, and prompts with images, stay on the Mac.
 
 On the Radeon, every kernel is checked against the plain MLX ops when a model loads, and a layer that fails a check keeps the plain ops.
 
@@ -65,9 +76,16 @@ On the Radeon, every kernel is checked against the plain MLX ops when a model lo
 - **Sparse attention**: each query row attends to its 512 selected key blocks. The block selection keeps each row's scores in registers across several waves, so its cost stays low at long contexts.
 - **Hyper-connections**: fused norm, mix, and write kernels. Each dense linear is stored in whichever layout hipBLASLt multiplies faster for its shape.
 
+**Inkling 2 Mini**
+
+- **Looped layers**: the Halo takes layer visits, not layers. Its share can reach into the second and third pass over the middle layers, so it holds each of those layers once and rebuilds the message bank each pass reads from the pass before.
+- **Experts**: NVFP4 codes decode straight to bf16 inside a WMMA kernel, with the activation applied as the up projection stores. One launch sorts a chunk's rows by expert for both projections.
+- **Attention**: one WMMA kernel per layer covers every query head that shares a key/value head, with the relative-position bias and the attention sink built in.
+- **Glue**: the depth mix with its norms, the short convolutions with their residual adds, the clips, the output gate and the loop controllers are one kernel each.
+
 ## Models
 
-The same six families and contract version as the CUDA helper.
+The same families and contract versions as the CUDA helper.
 
 | Family | `model_type` | On the Radeon |
 | --- | --- | --- |
@@ -76,7 +94,8 @@ The same six families and contract version as the CUDA helper.
 | MiniMax M3 / M3.1 | `minimax_m3_vl` | Portable ops |
 | GLM-5.3 Flash | `glm5_next` | Portable ops |
 | DeepSeek V4.1 | `deepseek_v41` | Portable ops |
-| Inkling 2 Small | `inkling2` | Portable ops |
+| Inkling 2 Small | `inkling2` | Optimized kernels |
+| Inkling 2 Mini | `inkling2_loop` | Optimized kernels |
 
 Every family matches oMLX's recorded contract output on gfx1151. oQh checkpoints stay on the Mac, and checkpoints with 3-bit experts are not supported on the Halo yet.
 
