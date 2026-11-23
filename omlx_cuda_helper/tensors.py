@@ -202,6 +202,27 @@ class Linear:
         """x in this layer's oQh basis, None for a layer without one."""
         return None if self.rotation is None else oqh.rotate(x, *self.rotation)
 
+    def rows(self, x: mx.array, start: int, end: int | None) -> mx.array:
+        """Output rows ``[start:end]`` of ``x @ W.T``, as the host projects a
+        slice of a Linear: through those rows of the weight only."""
+        if self.rotation is not None:
+            return self(x)[..., start:end]
+        if self.quant is None:
+            if self.columns:
+                return x @ self.weight[:, start:end]
+            return x @ self.weight[start:end].T
+        scales, biases, quant = self.quant
+        return mx.quantized_matmul(
+            x,
+            self.weight[start:end],
+            scales[start:end],
+            None if biases is None else biases[start:end],
+            transpose=True,
+            group_size=quant["group_size"],
+            bits=quant["bits"],
+            mode=quant.get("mode", "affine"),
+        )
+
     def __call__(self, x: mx.array, rotated: mx.array | None = None) -> mx.array:
         """x @ W.T; an oQh layer takes ``rotated`` (its basis) or rotates x."""
         if self.rotation is not None:

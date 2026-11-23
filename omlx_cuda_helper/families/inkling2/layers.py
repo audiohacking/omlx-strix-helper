@@ -263,6 +263,27 @@ def mix(blocks: list, partial: mx.array, query: mx.array) -> mx.array:
     return w.swapaxes(-1, -2) @ src
 
 
+def mix_messages(x, message, down, gain_forget):
+    """Loop controllers: ``(1 - tanh(forget)) * x + tanh(gain) * message``.
+
+    ``x`` and ``message`` are [N, 1, L, H] float32, one row per controlled
+    input; ``down`` [N, 2, H, r] (the x and message halves), ``gain_forget``
+    [N, r, 2H]. As the host: the down projection takes bf16-rounded inputs,
+    as a batched matmul over the halves, and rounds once.
+    """
+    n, b, length, hidden = x.shape
+    rows = b * length
+    z = mx.stack([unit_rms(x), unit_rms(message)], axis=1)
+    z = z.astype(mx.bfloat16).astype(mx.float32).reshape(2 * n, rows, hidden)
+    low = z @ down.reshape(2 * n, hidden, -1)
+    low = low.reshape(n, 2, rows, -1).sum(axis=1)
+    low = low.astype(mx.bfloat16).astype(mx.float32)
+    gates = (low @ gain_forget).reshape(n, b, length, 2 * hidden)
+    gain = mx.tanh(gates[..., :hidden])
+    forget = mx.tanh(gates[..., hidden:])
+    return (1.0 - forget) * x + gain * message
+
+
 def _bias_band(rel: mx.array, c: int, near: int) -> mx.array:
     """``rel[..., i, clip(c + i - j, 0, r - 1)]`` for ``j < near``, where
     ``0 <= c + i - j < r``; other entries are left to the caller's mask.
@@ -554,6 +575,16 @@ class Layer:
         self.attn_query = w.get("attn_input.query")
         self.mlp_query = w["mlp_input.query"]
         self.experts = Experts(w, cfg, expert_specs(config, cfg, i, w))
+        # A looped core layer's message queries and controllers for its q, k,
+        # v and MLP inputs, in that order; only passes after the first read
+        # them. The controllers run in float32, as the host widens them.
+        self.loop = None
+        if "loop_message.query" in w:
+            self.loop = (
+                w["loop_message.query"].astype(mx.float32),
+                w["loop_down"].astype(mx.float32),
+                w["loop_gain_forget"].astype(mx.float32),
+            )
         self.scale = dim**-0.5
         self.sconv_scale = 1.0 / math.sqrt(cfg.conv_k + 1)
         self.dconv_scale = 1.0 / math.sqrt(2 * cfg.conv_k + 1)
@@ -574,6 +605,8 @@ class Layer:
         own += [self.attn_conv, self.mlp_conv, self.mlp_norm, self.mlp_query]
         if self.attn_query is not None:
             own.append(self.attn_query)
+        if self.loop is not None:
+            own += list(self.loop)
         return own + self.experts.parameters()
 
     def _tau(self, offset: int, length: int) -> mx.array | None:
@@ -598,7 +631,19 @@ class Layer:
             )
             for c, width in zip(cache.conv[:2], (self.dkv, self.dkv))
         ]
-        if self.sliding:
+        if self.sliding and xk is not None:
+            # A looped pass gives q, k and v their own inputs; each takes only
+            # the rows of ``in_proj`` it uses, as the host projects them.
+            c0, c1, c2 = self.cuts[:3]
+            q = self.in_proj.rows(xq, 0, c0)
+            k = self.in_proj.rows(xk, c0, c1)
+            v = self.in_proj.rows(xv, c1, c2)
+            r, gate, sink = mx.split(
+                self.in_proj.rows(xq, c2, None), [c - c2 for c in self.cuts[3:]], axis=-1
+            )
+            k, ks = static_conv(k, self.k_conv, states[0], self.sconv_scale)
+            v, vs = static_conv(v, self.v_conv, states[1], self.sconv_scale)
+        elif self.sliding:
             q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self.cuts, axis=-1)
             k, ks = static_conv(k, self.k_conv, states[0], self.sconv_scale)
             v, vs = static_conv(v, self.v_conv, states[1], self.sconv_scale)
@@ -663,9 +708,12 @@ class Layer:
         )
         return out.transpose(0, 2, 1, 3)
 
-    def __call__(self, h: mx.array, blocks: list, cache: Cache) -> mx.array:
+    def __call__(
+        self, h: mx.array, blocks: list, cache: Cache, bank: tuple | None = None
+    ) -> mx.array:
         """``h``: the partial block sum [1, L, H]. ``blocks`` (unit-RMS float32
-        completed blocks) gains a block at a boundary layer."""
+        completed blocks) gains a block at a boundary layer. ``bank``: in a
+        looped pass after the first, the last pass's ``(blocks, partial)``."""
         cfg, dtype = self.cfg, h.dtype
         length, hidden = h.shape[1], h.shape[2]
         h_n = unit_rms(h)
@@ -674,11 +722,28 @@ class Layer:
         else:
             mixed = mix(blocks, h_n, self.attn_query)
             xq = mixed[:, :, 0]
-            if not self.sliding:
+            if self.sliding:
+                xk = xv = xq
+            else:
                 xk, xv = mixed[:, :, 1], mixed[:, :, 2]
-        if self.sliding:
+        messages = None
+        if bank is not None:
+            query, down, gain_forget = self.loop
+            messages = mix(*bank, query)
+            xq, xk, xv = mix_messages(
+                mx.stack([xq, xk, xv]),
+                messages[:, :, :3].transpose(2, 0, 1, 3),
+                down[:3],
+                gain_forget[:3],
+            )
+        if self.sliding and messages is None:
             xq = mx.fast.rms_norm(xq, self.attn_norm, cfg.eps).astype(dtype)
             xk = xv = None
+        elif self.sliding:
+            xq, xk, xv = (
+                mx.fast.rms_norm(x, self.attn_norm, cfg.eps).astype(dtype)
+                for x in (xq, xk, xv)
+            )
         else:
             xq, xk, xv = (
                 mx.fast.rms_norm(x, weight, cfg.eps).astype(dtype)
@@ -701,6 +766,11 @@ class Layer:
         else:
             residual = h.astype(mx.float32) + a.astype(mx.float32)
         y = mix(blocks, unit_rms(residual), self.mlp_query)[:, :, 0]
+        if messages is not None:
+            _, down, gain_forget = self.loop
+            y = mix_messages(
+                y[None], messages[None, :, :, 3], down[3:], gain_forget[3:]
+            ).squeeze(0)
         m = self.experts(mx.fast.rms_norm(y, self.mlp_norm, cfg.eps).astype(dtype))
         m, s3 = static_conv(m, self.mlp_conv, states[1], self.sconv_scale)
         cache.conv[2], cache.conv[3] = s2, s3
