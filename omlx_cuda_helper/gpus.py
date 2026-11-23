@@ -100,6 +100,18 @@ def _shared_memory_gpu(only: list[int] | None) -> list[dict[str, Any]]:
     ]
 
 
+def smi_error() -> str:
+    """Why ``gpus`` found none: what nvidia-smi says (it writes its errors to
+    stdout), else why no shared-memory GPU was taken."""
+    said = " ".join(_run("nvidia-smi", "-L").split())
+    if said:
+        return said
+    total, _ = memory()
+    if total <= 0:
+        return "no NVIDIA GPU, and the system memory could not be read"
+    return "no NVIDIA GPU, and the shared-memory GPU is not among the GPUs to use"
+
+
 # What MLX does not count on a card: CUDA's context and the cuBLAS and cuDNN
 # work buffers, which grow with a long prompt.
 UNCOUNTED_BYTES = 2 << 30
