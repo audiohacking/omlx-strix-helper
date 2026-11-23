@@ -312,6 +312,12 @@ __device__ __forceinline__ ink_v8f ink_wmma_bf(ink_v16s a, ink_v16s b, ink_v8f c
 __device__ __forceinline__ float ink_bf(unsigned short bits) {
   return __builtin_bit_cast(float, unsigned(bits) << 16);
 }
+// The value of lane i ^ 16: a VALU swap of the wave's halves, no LDS trip.
+__device__ __forceinline__ float ink_other_half(float x) {
+  const unsigned u = __builtin_bit_cast(unsigned, x);
+  return __builtin_bit_cast(
+      float, __builtin_amdgcn_permlanex16(u, u, 0x76543210u, 0xfedcba98u, false, false));
+}
 __device__ __forceinline__ ink_v16s ink_row16(const unsigned short* p) {
   union { ink_v16s v; ink_v4u u[2]; } c;
   c.u[0] = *reinterpret_cast<const ink_v4u*>(p);
@@ -451,8 +457,10 @@ for (int k0 = k_begin, it = 0; k0 <= a_last; k0 += BK, ++it) {
         for (int i = 0; i < 8; ++i) x[g][i] = -INFINITY;
       }
     }
-    mx = fmaxf(mx, __shfl_xor(mx, 16));
-    const float n = fmaxf(m, mx);
+    mx = fmaxf(mx, ink_other_half(mx));
+    // The running max moves only when the tile's exceeds it by 2^8: the
+    // weights stay below 256 (fine in fp16) and most tiles skip the rescale.
+    const float n = mx > m + 8.f ? mx : m;
     const float f = exp2f(m - n);
     float sum = 0.f;
 #pragma unroll
@@ -463,11 +471,13 @@ for (int k0 = k_begin, it = 0; k0 <= a_last; k0 += BK, ++it) {
         sum += x[g][i];
       }
     }
-    sum += __shfl_xor(sum, 16);
+    sum += ink_other_half(sum);
     l = l * f + sum;
     m = n;
+    if (__builtin_amdgcn_ballot_w32(f != 1.f)) {
 #pragma unroll
-    for (int t = 0; t < D / 16; ++t) o[t] = o[t] * f;
+      for (int t = 0; t < D / 16; ++t) o[t] = o[t] * f;
+    }
 #pragma unroll
     for (int g = 0; g < BK / 16; ++g) {
       if (!on[g]) continue;
@@ -475,7 +485,7 @@ for (int k0 = k_begin, it = 0; k0 <= a_last; k0 += BK, ++it) {
       ink_v16h pf;
 #pragma unroll
       for (int i = 0; i < 8; ++i) {
-        const float other = __shfl_xor(x[g][i], 16);
+        const float other = ink_other_half(x[g][i]);
         pf[2 * i + half] = (_Float16)x[g][i];
         pf[2 * i + 1 - half] = (_Float16)other;
       }
@@ -1259,6 +1269,135 @@ def gather(x: mx.array, bank, experts: mx.array) -> mx.array:
     return deepseek.expert_down(x, experts, bank)
 
 
+# The query, key and relative-state clips for HIP: one wave per (row, head)
+# vector of D values at column OFF + head * D of rows W wide. In float32 the
+# vector takes its per-head scale (SCALED), is clipped to an L2 norm of
+# threshold and rounded to bf16, then (TAU) scaled by its row's tau and
+# rounded again, as the plain ops round between the two.
+_CLIP_HIP = """
+const int v = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
+const int lane = threadIdx.x & 31;
+if (v >= dims[0] * HEADS) return;
+const int row = v / HEADS, head = v % HEADS;
+const unsigned short* xb = reinterpret_cast<const unsigned short*>(x) + (size_t)row * W + OFF + head * D;
+constexpr int EACH = (D + 31) / 32;
+float vals[EACH];
+float ss = 0.f;
+#pragma unroll
+for (int j = 0; j < EACH; ++j) {
+  const int d = lane + 32 * j;
+  float f = 0.f;
+  if (d < D) {
+    f = __builtin_bit_cast(float, unsigned(xb[d]) << 16);
+    if (SCALED) f *= scale[head * D + d];
+  }
+  vals[j] = f;
+  ss += f * f;
+}
+#pragma unroll
+for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor(ss, off);
+const float c = fminf(threshold[0] / (sqrtf(ss) + 1e-6f), 1.f);
+const float t = TAU ? tau[row] : 1.f;
+unsigned short* ob = reinterpret_cast<unsigned short*>(out) + (size_t)v * D;
+#pragma unroll
+for (int j = 0; j < EACH; ++j) {
+  const int d = lane + 32 * j;
+  if (d < D) {
+    unsigned u = __builtin_bit_cast(unsigned, vals[j] * c);
+    u = (u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u;
+    if (TAU) {
+      u = __builtin_bit_cast(unsigned, __builtin_bit_cast(float, u) * t);
+      u = (u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u;
+    }
+    ob[d] = (unsigned short)(u >> 16);
+  }
+}
+"""
+
+# The attention output gate for HIP: out * sigmoid(gate) in float32, rounded
+# to bf16, the gate at column OFF of rows W wide; 8 values a thread.
+_GATE_HIP = """
+const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+const int n = dims[0];
+if (i >= (size_t)n * N) return;
+const size_t row = i / N, col = i % N;
+const unsigned short* ob = reinterpret_cast<const unsigned short*>(attn) + i;
+const unsigned short* gb = reinterpret_cast<const unsigned short*>(proj) + row * W + OFF + col;
+unsigned short* yb = reinterpret_cast<unsigned short*>(y) + i;
+#pragma unroll
+for (int j = 0; j < 8; ++j) {
+  const float a = __builtin_bit_cast(float, unsigned(ob[j]) << 16);
+  const float g = __builtin_bit_cast(float, unsigned(gb[j]) << 16);
+  const unsigned u = __builtin_bit_cast(unsigned, a * (1.f / (1.f + expf(-g))));
+  yb[j] = (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+"""
+
+
+@functools.cache
+def _clip_kernel():
+    return mx.fast.cuda_kernel(
+        name="omlx_inkling2_clip_hip",
+        input_names=["x", "scale", "threshold", "tau", "dims"],
+        output_names=["out"],
+        source=_CLIP_HIP,
+    )
+
+
+@functools.cache
+def _gate_kernel():
+    return mx.fast.cuda_kernel(
+        name="omlx_inkling2_gate_hip",
+        input_names=["attn", "proj", "dims"],
+        output_names=["y"],
+        source=_GATE_HIP,
+    )
+
+
+def l2_clip(base, offset, heads, dim, scale, threshold, tau=None) -> mx.array:
+    """Heads ``[offset, offset + heads * dim)`` of ``base`` [1, L, W] bf16,
+    clipped (and tau-scaled): [1, L, heads, dim] bf16."""
+    length, width = base.shape[1], base.shape[2]
+    one = mx.zeros((1,), dtype=mx.float32)
+    out = _clip_kernel()(
+        inputs=[
+            base,
+            one if scale is None else scale.astype(mx.float32).reshape(-1),
+            mx.array([threshold], dtype=mx.float32),
+            one if tau is None else tau.astype(mx.float32).reshape(-1),
+            mx.array([length], dtype=mx.int32),
+        ],
+        template=[
+            ("D", dim),
+            ("HEADS", heads),
+            ("W", width),
+            ("OFF", offset),
+            ("SCALED", int(scale is not None)),
+            ("TAU", int(tau is not None)),
+        ],
+        grid=(-(-length * heads // 8) * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1, length, heads, dim)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+    return out
+
+
+def gate(attn: mx.array, base: mx.array, offset: int) -> mx.array:
+    """``attn`` [1, L, N] bf16 times sigmoid of ``base``'s columns
+    ``[offset, offset + N)``: [1, L, N] bf16."""
+    length, width = attn.shape[1], attn.shape[2]
+    count = length * width // 8
+    return _gate_kernel()(
+        inputs=[mx.contiguous(attn), base, mx.array([length], dtype=mx.int32)],
+        template=[("N", width), ("W", base.shape[2]), ("OFF", offset)],
+        grid=(-(-count // 256) * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1, length, width)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+
 # The MiniMax combine (mlx-serve moe_prefill_sum) for HIP: each product
 # rounds before its add, in expert order, then one rounding to bf16.
 _WEIGHTED_SUM_HIP = """
@@ -1475,8 +1614,39 @@ def enable(cfg, dtype: mx.Dtype) -> None:
         error = _relative(nvfp4_gemm(x, nvfp4_pack(bank), rows), want)
         _check("nvfp4", error <= 1e-3, f"relative error {error:.2e}")
 
+    def check_clip():
+        # A full layer's q and r slices of one projection, with tau.
+        heads, dim = cfg.heads, cfg.head_dim
+        width = heads * dim + heads * cfg.d_rel + 40
+        base = (mx.random.normal((1, 70, width)) * 3).astype(dtype)
+        scale = mx.random.uniform(0.5, 2.0, (heads, dim))
+        tau = mx.random.uniform(1.0, 1.3, (1, 70, 1, 1))
+        worst = 0.0
+        for offset, d, sc, threshold, t in (
+            (0, dim, scale, cfg.qk_clip, tau),
+            (heads * dim, cfg.d_rel, None, cfg.rel_clip, None),
+        ):
+            x = base[..., offset : offset + heads * d].reshape(1, 70, heads, d)
+            want = layers.l2_clip(x, sc, threshold)
+            if t is not None:
+                want = (want.astype(mx.float32) * t).astype(want.dtype)
+            got = l2_clip(base, offset, heads, d, sc, threshold, t)
+            worst = max(worst, _relative(got, want))
+        _check("clip", worst <= 1e-2, f"relative error {worst:.2e}")
+
+    def check_gate():
+        width = cfg.heads * cfg.head_dim
+        attn = mx.random.normal((1, 70, width)).astype(dtype)
+        base = mx.random.normal((1, 70, width + 72)).astype(dtype)
+        g = base[..., 40 : 40 + width]
+        want = (attn.astype(mx.float32) * mx.sigmoid(g.astype(mx.float32))).astype(dtype)
+        error = _relative(gate(attn, base, 40), want)
+        _check("gate", error <= 1e-2, f"relative error {error:.2e}")
+
     if _rocm():
         _guarded("nvfp4", check_nvfp4)
+        _guarded("clip", check_clip)
+        _guarded("gate", check_gate)
     _guarded("attention", check_attention)
     _guarded("mix", check_mix)
     _guarded("route", check_route)

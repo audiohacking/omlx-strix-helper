@@ -631,6 +631,7 @@ class Layer:
             )
             for c, width in zip(cache.conv[:2], (self.dkv, self.dkv))
         ]
+        # Where q, r and the gate sit: (projection output, first column).
         if self.sliding and xk is not None:
             # A looped pass gives q, k and v their own inputs; each takes only
             # the rows of ``in_proj`` it uses, as the host projects them.
@@ -638,17 +639,21 @@ class Layer:
             q = self.in_proj.rows(xq, 0, c0)
             k = self.in_proj.rows(xk, c0, c1)
             v = self.in_proj.rows(xv, c1, c2)
-            r, gate, sink = mx.split(
-                self.in_proj.rows(xq, c2, None), [c - c2 for c in self.cuts[3:]], axis=-1
-            )
+            tail = self.in_proj.rows(xq, c2, None)
+            r, gate, sink = mx.split(tail, [c - c2 for c in self.cuts[3:]], axis=-1)
+            at = {"q": (q, 0), "r": (tail, 0), "gate": (tail, self.cuts[3] - c2)}
             k, ks = static_conv(k, self.k_conv, states[0], self.sconv_scale)
             v, vs = static_conv(v, self.v_conv, states[1], self.sconv_scale)
         elif self.sliding:
-            q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self.cuts, axis=-1)
+            proj = self.in_proj(xq)
+            q, k, v, r, gate, sink = mx.split(proj, self.cuts, axis=-1)
+            at = {"q": (proj, 0), "r": (proj, self.cuts[2]), "gate": (proj, self.cuts[3])}
             k, ks = static_conv(k, self.k_conv, states[0], self.sconv_scale)
             v, vs = static_conv(v, self.v_conv, states[1], self.sconv_scale)
         else:
-            q, r, gate, sink = mx.split(self.q_proj(xq), self.cuts, axis=-1)
+            proj = self.q_proj(xq)
+            q, r, gate, sink = mx.split(proj, self.cuts, axis=-1)
+            at = {"q": (proj, 0), "r": (proj, self.cuts[0]), "gate": (proj, self.cuts[1])}
             kp, vp = self.k_proj(xk), self.v_proj(xv)
             dkv, kv = self.dkv, self.kv_heads
             k, ks = dynamic_conv(
@@ -668,19 +673,32 @@ class Layer:
                 self.dconv_scale,
             )
         cache.conv[0], cache.conv[1] = ks, vs
-        q = l2_clip(
-            q.reshape(1, length, self.heads, self.dim), self.q_scale, cfg.qk_clip
-        )
-        k = l2_clip(k.reshape(1, length, self.kv_heads, self.dim), None, cfg.qk_clip)
-        v = unit_rms(v.reshape(1, length, self.kv_heads, self.dim)).astype(xq.dtype)
-        r = l2_clip(
-            r.reshape(1, length, self.heads, cfg.d_rel), self.r_scale, cfg.rel_clip
-        )
         tau = self._tau(cache.offset, length)
-        if tau is not None:
-            q = (q.astype(mx.float32) * tau).astype(q.dtype)
-            r = (r.astype(mx.float32) * tau).astype(r.dtype)
+        if kernels.enabled("clip") and xq.dtype == mx.bfloat16:
+            heads, dim, d_rel = self.heads, self.dim, cfg.d_rel
+            q = kernels.l2_clip(*at["q"], heads, dim, self.q_scale, cfg.qk_clip, tau)
+            k = kernels.l2_clip(mx.contiguous(k), 0, self.kv_heads, dim, None, cfg.qk_clip)
+            r = kernels.l2_clip(*at["r"], heads, d_rel, self.r_scale, cfg.rel_clip, tau)
+        else:
+            q = l2_clip(
+                q.reshape(1, length, self.heads, self.dim), self.q_scale, cfg.qk_clip
+            )
+            k = l2_clip(k.reshape(1, length, self.kv_heads, self.dim), None, cfg.qk_clip)
+            r = l2_clip(
+                r.reshape(1, length, self.heads, cfg.d_rel), self.r_scale, cfg.rel_clip
+            )
+            if tau is not None:
+                q = (q.astype(mx.float32) * tau).astype(q.dtype)
+                r = (r.astype(mx.float32) * tau).astype(r.dtype)
+        v = v.reshape(1, length, self.kv_heads, self.dim)
+        if v.dtype == mx.bfloat16:
+            # rms_norm keeps float32 inside and rounds once, as unit_rms then a cast.
+            v = mx.fast.rms_norm(v, None, 1e-6)
+        else:
+            v = unit_rms(v).astype(xq.dtype)
         rel = r @ self.rel_proj.astype(r.dtype)
+        if kernels.enabled("gate") and gate.dtype == mx.bfloat16:
+            gate = at["gate"]
         return q, k, v, rel, gate, sink
 
     def _attend(self, q, k, v, rel, sink, cache: Cache) -> mx.array:
@@ -753,8 +771,11 @@ class Layer:
         out = self._attend(q, k, v, rel, sink, cache)
         if self.boundary:
             blocks.append(h_n)
-        out = out.reshape(1, length, -1).astype(mx.float32)
-        out = (out * mx.sigmoid(gate.astype(mx.float32))).astype(gate.dtype)
+        if isinstance(gate, tuple):
+            out = kernels.gate(out.reshape(1, length, -1), *gate)
+        else:
+            out = out.reshape(1, length, -1).astype(mx.float32)
+            out = (out * mx.sigmoid(gate.astype(mx.float32))).astype(gate.dtype)
         a = self.o_proj(out)
         states = [
             c if c is not None else mx.zeros((1, cfg.conv_k - 1, hidden), mx.float32)

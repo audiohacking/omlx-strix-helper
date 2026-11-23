@@ -123,7 +123,7 @@ class Stage(LayerStage):
             for slot, value in enumerate(cache.conv):
                 state[f"{visit}.c{slot}"] = value
             # Bound the lazy graph (and its temporaries) to one visit.
-            mx.eval(h, blocks, *state.values(), *cache.arrays(), *kept.values())
+            mx.async_eval(h, blocks, *state.values(), *cache.arrays(), *kept.values())
         return h, state, kept
 
     def warm(self, tokens: int) -> float:
