@@ -1398,6 +1398,147 @@ def gate(attn: mx.array, base: mx.array, offset: int) -> mx.array:
     )[0]
 
 
+# The loop controllers for HIP, around their two matmuls. Input i of n reads
+# query (QX == 1 ? 0 : i) of ``mixed`` [L, QX, H] and message M0 + i of
+# ``messages`` [L, 4, H], float32. ``inputs`` writes z [n, L, 2H] bf16: the
+# unit-RMS input, then the unit-RMS message. ``outputs`` takes the gates
+# [n, L, 2H] float32 (gain, then forget), forms (1 - tanh(forget)) * x +
+# tanh(gain) * message and its RMSNorm with ``weight``, rounded to bf16.
+# One 256-thread block per (input, row).
+_MESSAGES_HEADER = """
+__device__ __forceinline__ float ink_block_sum(float v, float* red) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off);
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  __syncthreads();
+  if (lane == 0) red[warp] = v;
+  __syncthreads();
+  float t = 0.f;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) t += red[j];
+  return t;
+}
+"""
+_MESSAGES_IN = """
+__shared__ float red[8];
+const int row = blockIdx.x, i = blockIdx.y;
+const float* xr = mixed + ((size_t)row * QX + (QX == 1 ? 0 : i)) * H;
+const float* mr = messages + ((size_t)row * 4 + M0 + i) * H;
+constexpr int EACH = (H + 255) / 256;
+float xv[EACH], mv[EACH];
+float sx = 0.f, sm = 0.f;
+#pragma unroll
+for (int j = 0; j < EACH; ++j) {
+  const int c = threadIdx.x + 256 * j;
+  xv[j] = c < H ? xr[c] : 0.f;
+  mv[j] = c < H ? mr[c] : 0.f;
+  sx += xv[j] * xv[j];
+  sm += mv[j] * mv[j];
+}
+sx = ink_block_sum(sx, red);
+sm = ink_block_sum(sm, red);
+const float rx = rsqrtf(sx / H + 1e-6f), rm = rsqrtf(sm / H + 1e-6f);
+unsigned short* zr = reinterpret_cast<unsigned short*>(z) + ((size_t)i * L + row) * 2 * H;
+#pragma unroll
+for (int j = 0; j < EACH; ++j) {
+  const int c = threadIdx.x + 256 * j;
+  if (c < H) {
+    unsigned u = __builtin_bit_cast(unsigned, xv[j] * rx);
+    zr[c] = (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    u = __builtin_bit_cast(unsigned, mv[j] * rm);
+    zr[H + c] = (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  }
+}
+"""
+_MESSAGES_OUT = """
+__shared__ float red[8];
+const int row = blockIdx.x, i = blockIdx.y;
+const float* xr = mixed + ((size_t)row * QX + (QX == 1 ? 0 : i)) * H;
+const float* mr = messages + ((size_t)row * 4 + M0 + i) * H;
+const float* gr = gates + ((size_t)i * L + row) * 2 * H;
+constexpr int EACH = (H + 255) / 256;
+float yv[EACH];
+float ss = 0.f;
+#pragma unroll
+for (int j = 0; j < EACH; ++j) {
+  const int c = threadIdx.x + 256 * j;
+  float y = 0.f;
+  if (c < H) {
+    const float gain = tanhf(gr[c]), forget = tanhf(gr[H + c]);
+    y = (1.f - forget) * xr[c] + gain * mr[c];
+  }
+  yv[j] = y;
+  ss += y * y;
+}
+ss = ink_block_sum(ss, red);
+const float r = rsqrtf(ss / H + EPS[0]);
+unsigned short* out = reinterpret_cast<unsigned short*>(y) + ((size_t)i * L + row) * H;
+const unsigned short* wb = reinterpret_cast<const unsigned short*>(weight);
+#pragma unroll
+for (int j = 0; j < EACH; ++j) {
+  const int c = threadIdx.x + 256 * j;
+  if (c < H) {
+    const float wv = __builtin_bit_cast(float, unsigned(wb[c]) << 16);
+    const unsigned u = __builtin_bit_cast(unsigned, yv[j] * r * wv);
+    out[c] = (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  }
+}
+"""
+
+
+@functools.cache
+def _messages_kernels():
+    return (
+        mx.fast.cuda_kernel(
+            name="omlx_inkling2_messages_in",
+            input_names=["mixed", "messages"],
+            output_names=["z"],
+            source=_MESSAGES_IN,
+            header=_MESSAGES_HEADER,
+        ),
+        mx.fast.cuda_kernel(
+            name="omlx_inkling2_messages_out",
+            input_names=["mixed", "messages", "gates", "weight", "EPS"],
+            output_names=["y"],
+            source=_MESSAGES_OUT,
+            header=_MESSAGES_HEADER,
+        ),
+    )
+
+
+def mix_messages_normed(mixed, messages, m0, n, down, gain_forget, weight, eps):
+    """The loop controllers on ``n`` inputs and the RMSNorm after them:
+    ``mixed`` [1, L, QX, H] float32 (QX 1: every input reads query 0),
+    ``messages`` [1, L, 4, H]; ``down`` [n, 2H, r] bf16 (the x half, then the
+    message half), ``gain_forget`` [n, r, 2H] float32. Returns [n, 1, L, H]
+    bf16."""
+    _, length, qx, hidden = mixed.shape
+    first, second = _messages_kernels()
+    template = [("H", hidden), ("L", length), ("QX", qx), ("M0", m0)]
+    mixed = mx.contiguous(mixed)
+    messages = mx.contiguous(messages)
+    z = first(
+        inputs=[mixed, messages],
+        template=template,
+        grid=(length * 256, n, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(n, length, 2 * hidden)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+    # One bf16 matmul over both halves accumulates in float32 and rounds
+    # once, as the host's two float32 halves summed and rounded do.
+    low = (z @ down).astype(mx.float32)
+    gates = low @ gain_forget
+    return second(
+        inputs=[mixed, messages, gates, weight, mx.array([eps], dtype=mx.float32)],
+        template=template,
+        grid=(length * 256, n, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(n, 1, length, hidden)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+
 # The MiniMax combine (mlx-serve moe_prefill_sum) for HIP: each product
 # rounds before its add, in expert order, then one rounding to bf16.
 _WEIGHTED_SUM_HIP = """
@@ -1643,8 +1784,31 @@ def enable(cfg, dtype: mx.Dtype) -> None:
         error = _relative(gate(attn, base, 40), want)
         _check("gate", error <= 1e-2, f"relative error {error:.2e}")
 
+    def check_messages():
+        # Three inputs from a full layer's mix, then one from query 0.
+        hidden, rank = cfg.hidden, 64
+        mixed = mx.random.normal((1, 70, 3, hidden)) * 0.7
+        messages = mx.random.normal((1, 70, 4, hidden))
+        down = (mx.random.normal((4, 2, hidden, rank)) * 0.02).astype(dtype)
+        gf = (mx.random.normal((4, rank, 2 * hidden)) * 0.05).astype(dtype).astype(mx.float32)
+        weight = mx.random.uniform(0.5, 1.5, (hidden,)).astype(dtype)
+        worst = 0.0
+        for m0, n, mx_in in ((0, 3, mixed), (3, 1, mixed[:, :, :1])):
+            x = mx_in.transpose(2, 0, 1, 3) if mx_in.shape[2] == n else mx_in[:, :, :1].transpose(2, 0, 1, 3)
+            msg = messages[:, :, m0 : m0 + n].transpose(2, 0, 1, 3)
+            d = down[m0 : m0 + n]
+            want = layers.mix_messages(x, msg, d.astype(mx.float32), gf[m0 : m0 + n])
+            want = mx.fast.rms_norm(want, weight, cfg.eps).astype(dtype)
+            got = mix_messages_normed(
+                mx_in, messages, m0, n, d.reshape(n, 2 * hidden, rank),
+                gf[m0 : m0 + n], weight, cfg.eps,
+            )
+            worst = max(worst, _relative(got, want))
+        _check("messages", worst <= 1e-2, f"relative error {worst:.2e}")
+
     if _rocm():
         _guarded("nvfp4", check_nvfp4)
+        _guarded("messages", check_messages)
         _guarded("clip", check_clip)
         _guarded("gate", check_gate)
     _guarded("attention", check_attention)

@@ -579,12 +579,19 @@ class Layer:
         # v and MLP inputs, in that order; only passes after the first read
         # them. The controllers run in float32, as the host widens them.
         self.loop = None
+        self.loop_down16 = None
         if "loop_message.query" in w:
             self.loop = (
                 w["loop_message.query"].astype(mx.float32),
                 w["loop_down"].astype(mx.float32),
                 w["loop_gain_forget"].astype(mx.float32),
             )
+            # The down projection in bf16, halves stacked, when bf16 holds it
+            # exactly (the host widens bf16 weights): for the fused path.
+            down = self.loop[1]
+            if mx.array_equal(down.astype(mx.bfloat16).astype(mx.float32), down).item():
+                n, _, hidden, rank = down.shape
+                self.loop_down16 = down.astype(mx.bfloat16).reshape(n, 2 * hidden, rank)
         self.scale = dim**-0.5
         self.sconv_scale = 1.0 / math.sqrt(cfg.conv_k + 1)
         self.dconv_scale = 1.0 / math.sqrt(2 * cfg.conv_k + 1)
@@ -607,6 +614,8 @@ class Layer:
             own.append(self.attn_query)
         if self.loop is not None:
             own += list(self.loop)
+        if self.loop_down16 is not None:
+            own.append(self.loop_down16)
         return own + self.experts.parameters()
 
     def _tau(self, offset: int, length: int) -> mx.array | None:
@@ -745,16 +754,45 @@ class Layer:
             else:
                 xk, xv = mixed[:, :, 1], mixed[:, :, 2]
         messages = None
+        norms = [self.attn_norm] if self.sliding else self.input_norms
+        # The loop controllers and the norms after them in kernels: on ROCm,
+        # for bf16 weights the host widened.
+        fused = (
+            bank is not None
+            and self.index > 0
+            and self.loop_down16 is not None
+            and dtype == mx.bfloat16
+            and all(n.dtype == mx.bfloat16 for n in [*norms, self.mlp_norm])
+            and kernels.enabled("messages")
+        )
         if bank is not None:
             query, down, gain_forget = self.loop
             messages = mix(*bank, query)
+        if fused and self.sliding:
+            xq, xk, xv = kernels.mix_messages_normed(
+                mixed[:, :, :1], messages, 0, 3, self.loop_down16[:3],
+                gain_forget[:3], self.attn_norm, cfg.eps,
+            )
+        elif fused:
+            # Each full-layer input has its own norm: one call each.
+            xq, xk, xv = (
+                kernels.mix_messages_normed(
+                    mixed[:, :, i : i + 1], messages, i, 1,
+                    self.loop_down16[i : i + 1], gain_forget[i : i + 1],
+                    weight, cfg.eps,
+                )[0]
+                for i, weight in enumerate(norms)
+            )
+        elif messages is not None:
             xq, xk, xv = mix_messages(
                 mx.stack([xq, xk, xv]),
                 messages[:, :, :3].transpose(2, 0, 1, 3),
                 down[:3],
                 gain_forget[:3],
             )
-        if self.sliding and messages is None:
+        if fused:
+            pass  # normalized with the controllers
+        elif self.sliding and messages is None:
             xq = mx.fast.rms_norm(xq, self.attn_norm, cfg.eps).astype(dtype)
             xk = xv = None
         elif self.sliding:
@@ -786,13 +824,22 @@ class Layer:
             residual = a.astype(mx.float32)
         else:
             residual = h.astype(mx.float32) + a.astype(mx.float32)
-        y = mix(blocks, unit_rms(residual), self.mlp_query)[:, :, 0]
-        if messages is not None:
-            _, down, gain_forget = self.loop
-            y = mix_messages(
-                y[None], messages[None, :, :, 3], down[3:], gain_forget[3:]
-            ).squeeze(0)
-        m = self.experts(mx.fast.rms_norm(y, self.mlp_norm, cfg.eps).astype(dtype))
+        y = mix(blocks, unit_rms(residual), self.mlp_query)
+        if fused:
+            _, _, gain_forget = self.loop
+            normed = kernels.mix_messages_normed(
+                y, messages, 3, 1, self.loop_down16[3:], gain_forget[3:],
+                self.mlp_norm, cfg.eps,
+            )[0]
+        else:
+            y = y[:, :, 0]
+            if messages is not None:
+                _, down, gain_forget = self.loop
+                y = mix_messages(
+                    y[None], messages[None, :, :, 3], down[3:], gain_forget[3:]
+                ).squeeze(0)
+            normed = mx.fast.rms_norm(y, self.mlp_norm, cfg.eps).astype(dtype)
+        m = self.experts(normed)
         m, s3 = static_conv(m, self.mlp_conv, states[1], self.sconv_scale)
         cache.conv[2], cache.conv[3] = s2, s3
         return (residual + m.astype(mx.float32)).astype(dtype)
