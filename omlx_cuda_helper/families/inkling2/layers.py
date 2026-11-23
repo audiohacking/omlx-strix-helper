@@ -782,18 +782,38 @@ class Layer:
         looped pass after the first, the last pass's ``(blocks, partial)``."""
         cfg, dtype = self.cfg, h.dtype
         length, hidden = h.shape[1], h.shape[2]
-        h_n = unit_rms(h)
-        if self.index == 0:
-            xq = xk = xv = h
-        else:
-            mixed = mix(blocks, h_n, self.attn_query)
-            xq = mixed[:, :, 0]
-            if self.sliding:
-                xk = xv = xq
-            else:
-                xk, xv = mixed[:, :, 1], mixed[:, :, 2]
-        messages = None
         norms = [self.attn_norm] if self.sliding else self.input_norms
+        # The unit RMS, the depth mix and (without a bank) the input norms in
+        # one kernel on ROCm.
+        mixnorm = (
+            self.index > 0
+            and dtype == mx.bfloat16
+            and len(blocks) + 1 <= kernels.MIX_SOURCES
+            and all(n.dtype == mx.bfloat16 for n in [*norms, self.mlp_norm])
+            and kernels.enabled("mixnorm")
+        )
+        prenormed = mixnorm and bank is None
+        if prenormed:
+            out, h_n = kernels.mix_fused(blocks, h, self.attn_query, norms, cfg.eps)
+            xq, xk, xv = _lead(out), None, None
+            if not self.sliding:
+                xk, xv = _lead(out[1:2]), _lead(out[2:3])
+        else:
+            if mixnorm:
+                mixed, h_n = kernels.mix_fused(blocks, h, self.attn_query)
+            else:
+                h_n = unit_rms(h)
+            if self.index == 0:
+                xq = xk = xv = h
+            else:
+                if not mixnorm:
+                    mixed = mix(blocks, h_n, self.attn_query)
+                xq = mixed[:, :, 0]
+                if self.sliding:
+                    xk = xv = xq
+                else:
+                    xk, xv = mixed[:, :, 1], mixed[:, :, 2]
+        messages = None
         # The loop controllers and the norms after them in kernels: on ROCm,
         # for bf16 weights the host widened.
         fused = (
@@ -832,8 +852,8 @@ class Layer:
                 down[:3],
                 gain_forget[:3],
             )
-        if fused:
-            pass  # normalized with the controllers
+        if fused or prenormed:
+            pass  # normalized with the controllers or the mix
         elif self.sliding and messages is None:
             xq = mx.fast.rms_norm(xq, self.attn_norm, cfg.eps).astype(dtype)
             xk = xv = None
@@ -866,8 +886,16 @@ class Layer:
             residual = a.astype(mx.float32)
         else:
             residual = h.astype(mx.float32) + a.astype(mx.float32)
-        y = mix(blocks, unit_rms(residual), self.mlp_query)
-        if fused:
+        if mixnorm and messages is None:
+            out, _ = kernels.mix_fused(blocks, residual, self.mlp_query, [self.mlp_norm], cfg.eps)
+            normed = _lead(out)
+        elif mixnorm:
+            y, _ = kernels.mix_fused(blocks, residual, self.mlp_query)
+        else:
+            y = mix(blocks, unit_rms(residual), self.mlp_query)
+        if mixnorm and messages is None:
+            pass  # normalized with the mix
+        elif fused:
             _, _, gain_forget = self.loop
             normed = _lead(
                 kernels.mix_messages_normed(

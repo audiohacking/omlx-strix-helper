@@ -1066,6 +1066,186 @@ def mix(blocks: list, partial: mx.array, query: mx.array, scale: float) -> mx.ar
     )[0]
 
 
+# The mix with what surrounds it, for HIP: one 256-thread block per row takes
+# the raw partial sum (PT: bf16 1, float32 0), its unit RMS (written to
+# ``partial_n`` with PART), the depth mixture over NS - 1 blocks and it with
+# Q queries, then (NORM) each query's RMSNorm with its weight, rounded to
+# bf16 as [Q, L, H]; without NORM the mixture stays float32 [L, Q, H].
+_MIX_FUSED_HIP = """
+constexpr int TG = 256, EACH = (H + TG - 1) / TG;
+const int L = gridDim.x;
+__shared__ float red[NS * Q > 1 ? NS * Q : 1][TG / 32];
+__shared__ float one[TG / 32];
+const int row = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+const size_t base = (size_t)row * H;
+auto block_sum = [&](float v) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off);
+  __syncthreads();
+  if (lane == 0) one[warp] = v;
+  __syncthreads();
+  float t = 0.f;
+#pragma unroll
+  for (int j = 0; j < TG / 32; ++j) t += one[j];
+  return t;
+};
+float pn[EACH];
+float ss = 0.f;
+#pragma unroll
+for (int j = 0; j < EACH; ++j) {
+  const int c = tid + TG * j;
+  float v = 0.f;
+  if (c < H) {
+    v = PT ? __builtin_bit_cast(float, unsigned(reinterpret_cast<const unsigned short*>(p)[base + c]) << 16)
+           : reinterpret_cast<const float*>(p)[base + c];
+  }
+  pn[j] = v;
+  ss += v * v;
+}
+const float rp = rsqrtf(block_sum(ss) / H + 1e-6f);
+#pragma unroll
+for (int j = 0; j < EACH; ++j) {
+  pn[j] *= rp;
+  const int c = tid + TG * j;
+  if (PART && c < H) partial_n[base + c] = pn[j];
+}
+float acc[NS * Q];
+#pragma unroll
+for (int i = 0; i < NS * Q; ++i) acc[i] = 0.f;
+#pragma unroll
+for (int j = 0; j < EACH; ++j) {
+  const int c = tid + TG * j;
+  if (c >= H) continue;
+  float s[NS];
+  LOADS
+  s[NS - 1] = pn[j];
+#pragma unroll
+  for (int qi = 0; qi < Q; ++qi) {
+    const float qv = query[qi * H + c];
+#pragma unroll
+    for (int n = 0; n < NS; ++n) acc[n * Q + qi] = fmaf(s[n], qv, acc[n * Q + qi]);
+  }
+}
+#pragma unroll
+for (int i = 0; i < NS * Q; ++i) {
+  float v = acc[i];
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off);
+  if (lane == 0) red[i][warp] = v;
+}
+__syncthreads();
+float w[NS * Q];
+#pragma unroll
+for (int i = 0; i < NS * Q; ++i) {
+  float t = 0.f;
+#pragma unroll
+  for (int j = 0; j < TG / 32; ++j) t += red[i][j];
+  w[i] = t * scale[0];
+}
+#pragma unroll
+for (int qi = 0; qi < Q; ++qi) {
+  float m = -__builtin_inff();
+#pragma unroll
+  for (int n = 0; n < NS; ++n) m = fmaxf(m, w[n * Q + qi]);
+  float z = 0.f;
+#pragma unroll
+  for (int n = 0; n < NS; ++n) {
+    w[n * Q + qi] = expf(w[n * Q + qi] - m);
+    z += w[n * Q + qi];
+  }
+#pragma unroll
+  for (int n = 0; n < NS; ++n) w[n * Q + qi] /= z;
+}
+#pragma unroll
+for (int qi = 0; qi < Q; ++qi) {
+  float y[EACH];
+  float sy = 0.f;
+#pragma unroll
+  for (int j = 0; j < EACH; ++j) {
+    const int c = tid + TG * j;
+    y[j] = 0.f;
+    if (c >= H) continue;
+    float s[NS];
+    LOADS
+    s[NS - 1] = pn[j];
+    float v = w[qi] * s[0];
+#pragma unroll
+    for (int n = 1; n < NS; ++n) v = fmaf(w[n * Q + qi], s[n], v);
+    y[j] = v;
+    sy += v * v;
+  }
+  if (NORM) {
+    const float r = rsqrtf(block_sum(sy) / H + eps[0]);
+    const unsigned short* wb = reinterpret_cast<const unsigned short*>(weight) + qi * H;
+    unsigned short* ob = reinterpret_cast<unsigned short*>(out) + ((size_t)qi * L + row) * H;
+#pragma unroll
+    for (int j = 0; j < EACH; ++j) {
+      const int c = tid + TG * j;
+      if (c < H) {
+        const float wv = __builtin_bit_cast(float, unsigned(wb[c]) << 16);
+        const unsigned u = __builtin_bit_cast(unsigned, y[j] * r * wv);
+        ob[c] = (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+      }
+    }
+  } else {
+    float* of = reinterpret_cast<float*>(out);
+#pragma unroll
+    for (int j = 0; j < EACH; ++j) {
+      const int c = tid + TG * j;
+      if (c < H) of[((size_t)row * Q + qi) * H + c] = y[j];
+    }
+  }
+}
+"""
+
+
+@functools.cache
+def _mix_fused_kernel(sources: int):
+    names = [f"b{i}" for i in range(sources - 1)]
+    loads = " ".join(f"s[{i}] = {n}[base + c];" for i, n in enumerate(names))
+    return mx.fast.cuda_kernel(
+        name=f"omlx_inkling2_mix_fused_{sources}",
+        input_names=[*names, "p", "query", "scale", "weight", "eps"],
+        output_names=["out", "partial_n"],
+        source=_MIX_FUSED_HIP.replace("LOADS", loads),
+    )
+
+
+def mix_fused(blocks: list, partial: mx.array, query: mx.array, weights=None, eps: float = 0.0):
+    """``mix(blocks, unit_rms(partial), query)`` from the raw ``partial`` [1,
+    L, H] (bf16 or float32), and with ``weights`` (one bf16 [H] per query)
+    each query's RMSNorm in bf16: (out, unit-RMS partial). ``out`` is [Q, 1,
+    L, H] bf16 with ``weights``, else [1, L, Q, H] float32."""
+    _, length, hidden = partial.shape
+    queries = query.shape[0]
+    norm = weights is not None
+    weight = mx.stack(list(weights)) if norm else mx.zeros((1,), dtype=mx.bfloat16)
+    out_shape = (queries, 1, length, hidden) if norm else (1, length, queries, hidden)
+    out, partial_n = _mix_fused_kernel(len(blocks) + 1)(
+        inputs=[
+            *blocks,
+            partial,
+            query,
+            mx.array([hidden**-0.5], dtype=mx.float32),
+            weight,
+            mx.array([eps], dtype=mx.float32),
+        ],
+        template=[
+            ("NS", len(blocks) + 1),
+            ("Q", queries),
+            ("H", hidden),
+            ("PT", int(partial.dtype == mx.bfloat16)),
+            ("PART", 1),
+            ("NORM", int(norm)),
+        ],
+        grid=(length * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[out_shape, (1, length, hidden)],
+        output_dtypes=[mx.bfloat16 if norm else mx.float32, mx.float32],
+    )
+    return out, partial_n
+
+
 # One warp per token row: sigmoid scores, top-k by score + bias (the lowest
 # expert wins a tie), weights renormalized from the unbiased scores.
 _ROUTE = """
@@ -1519,7 +1699,7 @@ __device__ __forceinline__ float ink_block_sum(float v, float* red) {
 """
 _MESSAGES_IN = """
 __shared__ float red[8];
-const int row = blockIdx.x, i = blockIdx.y;
+const int row = blockIdx.x, i = blockIdx.y, L = gridDim.x;
 const float* xr = mixed + ((size_t)row * QX + (QX == 1 ? 0 : i)) * H;
 const float* mr = messages + ((size_t)row * 4 + M0 + i) * H;
 constexpr int EACH = (H + 255) / 256;
@@ -1550,7 +1730,7 @@ for (int j = 0; j < EACH; ++j) {
 """
 _MESSAGES_OUT = """
 __shared__ float red[8];
-const int row = blockIdx.x, i = blockIdx.y;
+const int row = blockIdx.x, i = blockIdx.y, L = gridDim.x;
 const float* xr = mixed + ((size_t)row * QX + (QX == 1 ? 0 : i)) * H;
 const float* mr = messages + ((size_t)row * 4 + M0 + i) * H;
 const float* gr = gates + ((size_t)i * L + row) * 2 * H;
@@ -1612,7 +1792,7 @@ def mix_messages_normed(mixed, messages, m0, n, down, gain_forget, weight, eps):
     bf16."""
     _, length, qx, hidden = mixed.shape
     first, second = _messages_kernels()
-    template = [("H", hidden), ("L", length), ("QX", qx), ("M0", m0)]
+    template = [("H", hidden), ("QX", qx), ("M0", m0)]
     mixed = mx.contiguous(mixed)
     messages = mx.contiguous(messages)
     z = first(
@@ -1921,8 +2101,25 @@ def enable(cfg, dtype: mx.Dtype) -> None:
         ok = ok and mx.allclose(scaled, weights * post[inds]).item()
         _check("dispatch", ok, "the routed rows do not match their entries")
 
+    def check_mix_fused():
+        hidden = cfg.hidden
+        blocks = [layers.unit_rms(mx.random.normal((1, 70, hidden))) for _ in range(3)]
+        h = (mx.random.normal((1, 70, hidden)) * 4).astype(dtype)
+        query = mx.random.normal((3, hidden)) * 0.05
+        weights = [mx.random.uniform(0.5, 1.5, (hidden,)).astype(dtype) for _ in range(3)]
+        h_n = layers.unit_rms(h)
+        mixed = layers.mix(blocks, h_n, query)
+        want = [mx.fast.rms_norm(mixed[:, :, i], w, cfg.eps).astype(dtype) for i, w in enumerate(weights)]
+        got, got_n = mix_fused(blocks, h, query, weights, cfg.eps)
+        worst = max(_relative(got[i], want[i]) for i in range(3))
+        worst = max(worst, _relative(got_n, h_n))
+        plain, _ = mix_fused(blocks, h_n, query)
+        worst = max(worst, _relative(plain, layers.mix(blocks, layers.unit_rms(h_n), query)))
+        _check("mixnorm", worst <= 1e-2, f"relative error {worst:.2e}")
+
     if _rocm():
         _guarded("nvfp4", check_nvfp4)
+        _guarded("mixnorm", check_mix_fused)
         _guarded("dispatch", check_dispatch)
         _guarded("messages", check_messages)
         _guarded("clip", check_clip)
