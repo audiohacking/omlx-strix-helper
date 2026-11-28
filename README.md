@@ -17,7 +17,7 @@ Prefill tok/s on a 64K-token prompt with an M3 Ultra (512 GB), oQ4e checkpoints.
 | --- | ---: | ---: | ---: | ---: |
 | Qwen3.8 27B | 404 | 831 | 1,062* | 1,879* |
 | Qwen3.8 Flash-Next | 1,376 | 2,187 | 2,715* | 3,928* |
-| Inkling 2 Mini | 1,398 | 2,468 | — | — |
+| Inkling 2 Mini | 1,433 | 2,541 | — | — |
 
 * The DGX Spark and RTX A6000 figures are from the [oMLX 0.8.0 release notes](https://github.com/jundot/omlx/releases/tag/v0.8.0)
 * The Strix Halo figures are over Thunderbolt
@@ -32,13 +32,13 @@ M3 Ultra with one Strix Halo, 64 generated tokens, MTP on:
 | Qwen3.8 27B | 65,536 | 831 | 66 |
 | Qwen3.8 Flash-Next | 65,536 | 2,187 | — |
 
-Inkling 2 Mini, 512 generated tokens:
+Inkling 2 Mini on oMLX 0.8.4, 512 generated tokens:
 
 | Prompt | M3 Ultra alone | + Strix Halo | Time to first token | Decode tok/s |
 | ---: | ---: | ---: | ---: | ---: |
-| 8,192 | 1,744 | 2,325 | 4.7 s → 3.5 s | 105 |
-| 32,768 | 1,598 | 2,654 | 20.5 s → 12.3 s | 84 |
-| 65,536 | 1,398 | 2,468 | 46.9 s → 26.6 s | 72 |
+| 8,192 | 1,763 | 2,280 | 4.6 s → 3.6 s | 96 |
+| 32,768 | 1,611 | 2,696 | 20.3 s → 12.2 s | 92 |
+| 65,536 | 1,433 | 2,541 | 45.7 s → 25.8 s | 96 |
 
 ## Quick start
 
